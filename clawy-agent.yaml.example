@@ -1,0 +1,42 @@
+# Clawy Agent Configuration
+# Copy this file to clawy-agent.yaml and fill in your values.
+
+# LLM Provider
+llm:
+  provider: anthropic          # anthropic | openai | google
+  model: claude-sonnet-4-6
+  apiKey: ${ANTHROPIC_API_KEY}  # Environment variable reference
+
+# Channels (optional — enable the ones you need)
+# channels:
+#   telegram:
+#     token: ${TELEGRAM_BOT_TOKEN}
+#   discord:
+#     token: ${DISCORD_BOT_TOKEN}
+#   webhook:
+#     url: https://my-app.com/webhook
+#     secret: ${WEBHOOK_SECRET}
+
+# Hooks
+hooks:
+  builtin:
+    factGrounding: true        # Hallucination prevention
+    preRefusalVerifier: true   # Prevents unnecessary refusals
+    workspaceAwareness: true   # Auto-injects filesystem context
+    sessionResume: true        # Seeds context on session resume
+    discipline: false          # TDD/git enforcement (default off)
+  # custom:
+  #   - path: ./hooks/my-hook.ts
+  #     event: beforeCommit
+  #     priority: 80
+
+# Memory (Hipocampus)
+memory:
+  enabled: true
+  compaction: true             # 5-level auto-compaction
+
+# Workspace
+workspace: ./workspace
+identity:
+  name: "Clawy Agent"
+  instructions: "You are a helpful coding assistant."

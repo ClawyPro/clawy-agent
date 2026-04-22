@@ -1,0 +1,776 @@
+/**
+ * SpawnAgent — native subagent delegation (§7.12.d).
+ *
+ * This file is the Tool-factory surface. Everything interesting moved
+ * to `../spawn/` during R4:
+ *   • ChildAgentLoop.ts   — runChildAgentLoop + selectChildTools
+ *   • Tournament.ts       — runTournament + rank/merge helpers (pure)
+ *   • ScoreVariant.ts     — T3-16 scoring (tool + haiku_rubric)
+ *   • SpawnWorkspace.ts   — prepareSpawnDir + countFilesRecursive + randomTaskId
+ *
+ * This module keeps three responsibilities:
+ *   1. Zod-style JSON input schema + two-layer input validation
+ *      (`validate()` hook + hard guard inside `execute()`).
+ *   2. `applyPersona` — T2-11 catalog expansion.
+ *   3. `makeSpawnAgentTool(agent, backgroundRegistry?)` factory that
+ *      glues the three deliver paths (tournament / return / background)
+ *      to the spawn runtime.
+ *
+ * External API stability (tests + Agent.ts import these names):
+ *   • makeSpawnAgentTool  — default export of the factory
+ *   • runChildAgentLoop   — re-exported from ../spawn/ChildAgentLoop
+ *   • selectChildTools    — re-exported from ../spawn/ChildAgentLoop
+ *   • SpawnChildOptions / SpawnChildResult — ditto
+ *   • MAX_SPAWN_DEPTH     — still authoritative here
+ *   • TournamentResult / TournamentVariantResult — re-exported
+ *   • prepareSpawnDir / countFilesRecursive / applyPersona — still
+ *     exported (SpawnAgent.test.ts reaches in for isolation tests).
+ */
+
+import path from "node:path";
+import type {
+  Tool,
+  ToolContext,
+  ToolResult,
+  ToolRegistry as IToolRegistry,
+} from "../Tool.js";
+import type { Agent } from "../Agent.js";
+import type { BackgroundTaskRegistry } from "../tasks/BackgroundTaskRegistry.js";
+import { errorResult } from "../util/toolResult.js";
+import type { ArtifactMeta } from "../artifacts/ArtifactManager.js";
+import {
+  ALLOWED_TOOLS_WILDCARD,
+  loadPersonaCatalog,
+  resolvePersona,
+  type PersonaCatalog,
+  type PersonaSpec,
+} from "../personas/catalog.js";
+import {
+  runTournament as runTournamentCore,
+  TOURNAMENT_MAX_CONCURRENCY,
+  TOURNAMENT_MAX_VARIANTS,
+  TOURNAMENT_MIN_VARIANTS,
+  type PreparedVariant,
+  type TournamentResult,
+  type TournamentVariantResult,
+} from "../spawn/Tournament.js";
+import {
+  runChildAgentLoop as runChildAgentLoopImpl,
+  selectChildTools as selectChildToolsImpl,
+  type SpawnChildOptions as SpawnChildOptionsImpl,
+  type SpawnChildResult as SpawnChildResultImpl,
+} from "../spawn/ChildAgentLoop.js";
+import {
+  scoreVariant,
+  type TournamentScorer as TournamentScorerImpl,
+} from "../spawn/ScoreVariant.js";
+import {
+  countFilesRecursive as countFilesRecursiveImpl,
+  prepareSpawnDir as prepareSpawnDirImpl,
+  randomTaskId,
+} from "../spawn/SpawnWorkspace.js";
+
+export const MAX_SPAWN_DEPTH = 2;
+const DEFAULT_TIMEOUT_MS = 120_000;
+const MAX_TIMEOUT_MS = 600_000;
+
+// Re-exports for API stability — Agent.ts + tests import these from
+// `tools/SpawnAgent.js`.
+export const runChildAgentLoop = runChildAgentLoopImpl;
+export const selectChildTools = selectChildToolsImpl;
+export const prepareSpawnDir = prepareSpawnDirImpl;
+export const countFilesRecursive = countFilesRecursiveImpl;
+export type SpawnChildOptions = SpawnChildOptionsImpl;
+export type SpawnChildResult = SpawnChildResultImpl;
+export type TournamentScorer = TournamentScorerImpl;
+export type { TournamentResult, TournamentVariantResult };
+
+export interface SpawnAgentInput {
+  persona: string;
+  prompt: string;
+  allowed_tools?: string[];
+  allowed_skills?: string[];
+  deliver: "return" | "background";
+  timeout_ms?: number;
+  metadata?: Record<string, unknown>;
+  /** T3-16 OMC Port A — tournament mode inputs. */
+  mode?: "single" | "tournament";
+  variants?: number;
+  scorer?: TournamentScorer;
+  concurrency?: number;
+  cleanup_losers?: boolean;
+}
+
+/**
+ * Minimal projection of an imported artifact surfaced on the spawn
+ * tool's output. Parent LLMs see `{artifactId, kind, title, l1Preview}`
+ * so they can decide whether to readL0 for the full content.
+ */
+export interface SpawnHandoffArtifact {
+  artifactId: string;
+  kind: string;
+  title: string;
+  slug: string;
+  /** 2-line overview (L1) if readable; empty string on missing sidecar. */
+  l1Preview: string;
+  /** Present when re-keyed on collision during import. */
+  importedFromArtifactId?: string;
+}
+
+export interface SpawnArtifacts {
+  /** Absolute path to the child's ephemeral workspace subdirectory. */
+  spawnDir: string;
+  /** Number of files present in spawnDir after child completion. */
+  fileCount: number;
+  /**
+   * Artifacts produced by the child that were imported into the
+   * parent's workspace via `ArtifactManager.importFromDir`. Parent LLM
+   * should call `ArtifactRead` (or `ArtifactManager.readL0`) on any
+   * `artifactId` here to pull full content. Empty list when the child
+   * produced no artifacts.
+   */
+  handedOffArtifacts: SpawnHandoffArtifact[];
+}
+
+export interface SpawnAgentOutput {
+  taskId: string;
+  status: "ok" | "error" | "aborted" | "pending";
+  finalText?: string;
+  toolCallCount?: number;
+  /**
+   * Narrow handoff API for parent access to child artifacts (PRE-01).
+   * Parent can `FileRead` via absolute path or `kubectl cp` if needed.
+   * Omitted in `deliver=background` immediate return (pending status).
+   */
+  artifacts?: SpawnArtifacts;
+  /** T3-16 — present only when `mode === "tournament"`. */
+  mode?: "tournament";
+  winnerIndex?: number;
+  variants?: TournamentVariantResult[];
+}
+
+const INPUT_SCHEMA = {
+  type: "object",
+  properties: {
+    persona: {
+      type: "string",
+      description:
+        "Sub-agent identity (e.g. 'legal-researcher'). Prepended as a system-prompt role.",
+    },
+    prompt: {
+      type: "string",
+      description: "Task description for the sub-agent.",
+    },
+    allowed_tools: {
+      type: "array",
+      items: { type: "string" },
+      description:
+        "Allowlist of tool names; intersected with the parent's registry. Omit to inherit all.",
+    },
+    allowed_skills: {
+      type: "array",
+      items: { type: "string" },
+      description: "Allowlist of skill tags to expose in addition to allowed_tools.",
+    },
+    deliver: {
+      type: "string",
+      enum: ["return", "background"],
+      description:
+        "'return' blocks the parent until the child finishes. 'background' returns a taskId immediately; child completion emits a spawn_result AgentEvent.",
+    },
+    timeout_ms: {
+      type: "integer",
+      minimum: 1000,
+      description: "Per-child timeout in ms (default 120000, max 600000).",
+    },
+    metadata: { type: "object", description: "Opaque metadata passed to the child." },
+    mode: {
+      type: "string",
+      enum: ["single", "tournament"],
+      description:
+        "T3-16 — 'single' (default) runs one child. 'tournament' spawns `variants` children in parallel and ranks them by `scorer`.",
+    },
+    variants: {
+      type: "integer",
+      minimum: TOURNAMENT_MIN_VARIANTS,
+      maximum: TOURNAMENT_MAX_VARIANTS,
+      description: "Tournament: number of variants (2..5).",
+    },
+    scorer: {
+      type: "object",
+      description:
+        "Tournament scorer — either a tool reference or a Haiku rubric string.",
+    },
+    concurrency: {
+      type: "integer",
+      minimum: 1,
+      maximum: TOURNAMENT_MAX_CONCURRENCY,
+      description: "Tournament: max concurrent children (default = variants, max 5).",
+    },
+    cleanup_losers: {
+      type: "boolean",
+      description:
+        "Tournament: when true, remove non-winning spawnDirs after ranking (default false).",
+    },
+  },
+  required: ["persona", "prompt", "deliver"],
+} as const;
+
+// ── Persona expansion (T2-11) ──────────────────────────────────────
+
+export interface PersonaExpansion {
+  /** Effective allowed_tools to pass to the child loop. `undefined` = inherit all parent tools. */
+  allowedTools: string[] | undefined;
+  /** Effective allowed_skills allowlist. `undefined` = no skill-tag filter. */
+  allowedSkills: string[] | undefined;
+  /** Task prompt — preset system_prompt prepended to the caller's prompt when applicable. */
+  prompt: string;
+  /** True when the persona name matched a catalog entry. */
+  matched: boolean;
+}
+
+/**
+ * Apply a persona catalog entry to a spawn call. Caller's explicit
+ * allowed_tools / allowed_skills always win over the preset. Wildcard
+ * `"*"` in the preset expands to `undefined` (inherit parent's full
+ * registry). Unmatched persona names pass through unchanged.
+ */
+export function applyPersona(
+  input: {
+    persona: string;
+    prompt: string;
+    allowed_tools?: string[];
+    allowed_skills?: string[];
+  },
+  catalog: PersonaCatalog,
+): PersonaExpansion {
+  const spec: PersonaSpec | null = resolvePersona(input.persona, catalog);
+  if (spec === null) {
+    return {
+      allowedTools: input.allowed_tools,
+      allowedSkills: input.allowed_skills,
+      prompt: input.prompt,
+      matched: false,
+    };
+  }
+  let allowedTools: string[] | undefined;
+  if (input.allowed_tools !== undefined) {
+    allowedTools = input.allowed_tools;
+  } else if (spec.allowed_tools === ALLOWED_TOOLS_WILDCARD) {
+    allowedTools = undefined;
+  } else {
+    allowedTools = spec.allowed_tools.slice();
+  }
+  const allowedSkills =
+    input.allowed_skills !== undefined
+      ? input.allowed_skills
+      : spec.allowed_skills
+        ? spec.allowed_skills.slice()
+        : undefined;
+  return {
+    allowedTools,
+    allowedSkills,
+    prompt: `${spec.system_prompt}\n\n${input.prompt}`,
+    matched: true,
+  };
+}
+
+// ── Tournament adapter ─────────────────────────────────────────────
+// Wires ctx/agent/scorer into the generic spawn/Tournament core.
+
+async function runTournamentAdapter(
+  input: SpawnAgentInput,
+  ctx: ToolContext,
+  agent: Agent,
+  baseChildOptions: Omit<SpawnChildOptions, "spawnDir" | "spawnWorkspace" | "taskId">,
+): Promise<TournamentResult> {
+  const variants = input.variants as number;
+  const scorer = input.scorer as TournamentScorer;
+  return runTournamentCore({
+    variants,
+    concurrency: input.concurrency,
+    cleanup_losers: input.cleanup_losers,
+    ctx: {
+      workspaceRoot: ctx.workspaceRoot,
+      turnId: ctx.turnId,
+      stageAuditEvent: ctx.staging.stageAuditEvent,
+      emitAgentEvent: ctx.emitAgentEvent,
+    },
+    prepareSpawnDir,
+    async runChild(prep: PreparedVariant) {
+      const childOptions: SpawnChildOptions = {
+        ...baseChildOptions,
+        taskId: prep.taskId,
+        spawnDir: prep.spawnDir,
+        spawnWorkspace: prep.spawnWorkspace,
+      };
+      const childResult = await agent.spawnChildTurn(childOptions);
+      return { finalText: childResult.finalText };
+    },
+    async scoreChild(_prep, finalText) {
+      return scoreVariant(finalText, scorer, ctx, agent);
+    },
+  });
+}
+
+/** Legacy name preserved for any external importers / tests. */
+export const runTournament = runTournamentAdapter;
+
+/**
+ * Spawn artifact handoff — PRE-01 fix for "4/5 리포트 유실".
+ *
+ * After a child finishes, any artifacts it produced under
+ * `{spawnDir}/artifacts/` are copied into the parent workspace via
+ * `ArtifactManager.importFromDir`. Returns the projection the parent
+ * LLM receives in `artifacts.handedOffArtifacts`. Import failures are
+ * absorbed so a flaky disk doesn't fail the whole spawn — the child's
+ * `finalText` still reaches the caller.
+ *
+ * When the child didn't write any artifacts (the common case today
+ * since ArtifactCreate binds to the parent's ArtifactManager at
+ * registration time) this is a no-op and returns `[]`.
+ */
+async function handOffChildArtifacts(
+  agent: Agent,
+  spawnDir: string,
+  taskId: string,
+  emit?: (event: unknown) => void,
+): Promise<SpawnHandoffArtifact[]> {
+  // Duck-type guard so test fakes without `.artifacts` don't crash.
+  const mgr = (agent as { artifacts?: Agent["artifacts"] }).artifacts;
+  if (!mgr) return [];
+  let imported: ArtifactMeta[] = [];
+  try {
+    imported = await mgr.importFromDir(spawnDir, { spawnTaskId: taskId });
+  } catch (err) {
+    emit?.({
+      type: "spawn_artifact_handoff_error",
+      taskId,
+      error: err instanceof Error ? err.message : String(err),
+    });
+    return [];
+  }
+  if (imported.length === 0) return [];
+
+  const projection: SpawnHandoffArtifact[] = [];
+  for (const meta of imported) {
+    let l1Preview = "";
+    try {
+      l1Preview = await mgr.readL1(meta.artifactId);
+    } catch {
+      /* sidecar missing — preview stays empty */
+    }
+    projection.push({
+      artifactId: meta.artifactId,
+      kind: meta.kind,
+      title: meta.title,
+      slug: meta.slug,
+      l1Preview,
+      ...(meta.importedFromArtifactId
+        ? { importedFromArtifactId: meta.importedFromArtifactId }
+        : {}),
+    });
+  }
+  emit?.({
+    type: "spawn_artifacts_imported",
+    taskId,
+    count: projection.length,
+    artifactIds: projection.map((a) => a.artifactId),
+  });
+  return projection;
+}
+
+// ── Validation helpers ─────────────────────────────────────────────
+
+function validateTournamentInput(input: SpawnAgentInput): string | null {
+  if (
+    typeof input.variants !== "number" ||
+    !Number.isInteger(input.variants) ||
+    input.variants < TOURNAMENT_MIN_VARIANTS ||
+    input.variants > TOURNAMENT_MAX_VARIANTS
+  ) {
+    return `tournament mode requires integer \`variants\` in [${TOURNAMENT_MIN_VARIANTS}..${TOURNAMENT_MAX_VARIANTS}]`;
+  }
+  if (!input.scorer || typeof input.scorer !== "object") {
+    return "tournament mode requires `scorer`";
+  }
+  const s = input.scorer;
+  if (s.kind !== "tool" && s.kind !== "haiku_rubric") {
+    return "`scorer.kind` must be 'tool' or 'haiku_rubric'";
+  }
+  if (s.kind === "tool" && (typeof s.toolName !== "string" || !s.toolName)) {
+    return "tool scorer requires `toolName`";
+  }
+  if (s.kind === "haiku_rubric" && (typeof s.rubric !== "string" || !s.rubric)) {
+    return "haiku_rubric scorer requires `rubric`";
+  }
+  if (
+    input.concurrency !== undefined &&
+    (typeof input.concurrency !== "number" ||
+      !Number.isInteger(input.concurrency) ||
+      input.concurrency < 1 ||
+      input.concurrency > input.variants)
+  ) {
+    return `\`concurrency\` must be integer in [1..${input.variants}]`;
+  }
+  return null;
+}
+
+function validateInput(input: SpawnAgentInput): string | null {
+  if (!input || typeof input.persona !== "string" || input.persona.length === 0) {
+    return "`persona` is required";
+  }
+  if (typeof input.prompt !== "string" || input.prompt.length === 0) {
+    return "`prompt` is required";
+  }
+  if (input.deliver !== "return" && input.deliver !== "background") {
+    return "`deliver` must be 'return' or 'background'";
+  }
+  if (input.mode === "tournament") {
+    return validateTournamentInput(input);
+  }
+  return null;
+}
+
+// ── Tool factory ───────────────────────────────────────────────────
+
+/**
+ * Build the SpawnAgent tool, bound to a specific Agent. The Agent
+ * reference gives us access to the shared LLMClient + ToolRegistry.
+ */
+export function makeSpawnAgentTool(
+  agent: Agent,
+  backgroundRegistry?: BackgroundTaskRegistry,
+): Tool<SpawnAgentInput, SpawnAgentOutput> {
+  return {
+    name: "SpawnAgent",
+    description:
+      "Delegate a focused sub-task to a child agent with a custom persona and filtered toolset. `deliver:\"return\"` blocks until the child finishes and returns its final text. `deliver:\"background\"` fires the child and returns a taskId immediately; completion surfaces as a spawn_result event. Spawn depth is capped at 2 — a depth-2 child cannot spawn further. Use this to keep the main agent as a meta-controller and hand heavy research/code/verification work to sub-agents. IMPORTANT: child output longer than ~500 chars should go into an ArtifactCreate (kind=report/analysis/etc.) rather than inlined in finalText — the spawn tool automatically imports any child-produced artifacts into the parent workspace and returns them on `artifacts.handedOffArtifacts`. Call ArtifactRead(artifactId) to pull full content. This prevents output loss when the child workspace is torn down.",
+    inputSchema: INPUT_SCHEMA,
+    permission: "meta",
+    kind: "core",
+    validate(input) {
+      return validateInput(input);
+    },
+    async execute(
+      input: SpawnAgentInput,
+      ctx: ToolContext,
+    ): Promise<ToolResult<SpawnAgentOutput>> {
+      const start = Date.now();
+      const parentDepth = ctx.spawnDepth ?? 0;
+
+      if (parentDepth >= MAX_SPAWN_DEPTH) {
+        return {
+          status: "error",
+          errorCode: "max_depth",
+          errorMessage: `spawn depth ${parentDepth} is at the MAX_SPAWN_DEPTH=${MAX_SPAWN_DEPTH} limit; this child cannot spawn further`,
+          durationMs: Date.now() - start,
+        };
+      }
+
+      // Hard guard (`validate()` is advisory; some runtimes skip it).
+      if (input.mode === "tournament") {
+        const err = validateTournamentInput(input);
+        if (err) {
+          return {
+            status: "error",
+            errorCode: "bad_input",
+            errorMessage: err,
+            durationMs: Date.now() - start,
+          };
+        }
+      }
+
+      const taskId = randomTaskId();
+      const timeoutMs = Math.min(
+        MAX_TIMEOUT_MS,
+        Math.max(1_000, input.timeout_ms ?? DEFAULT_TIMEOUT_MS),
+      );
+
+      // T2-11 persona catalog expansion. Loaded per-call so workspace
+      // overrides are picked up live; falls back to BUILTIN_PERSONAS on
+      // ENOENT / parse error (catalog loader swallows read errors).
+      const catalog = await loadPersonaCatalog(ctx.workspaceRoot);
+      const expanded = applyPersona(
+        {
+          persona: input.persona,
+          prompt: input.prompt,
+          allowed_tools: input.allowed_tools,
+          allowed_skills: input.allowed_skills,
+        },
+        catalog,
+      );
+
+      const baseChildOptions: Omit<
+        SpawnChildOptions,
+        "spawnDir" | "spawnWorkspace" | "taskId"
+      > = {
+        parentSessionKey: ctx.sessionKey,
+        parentTurnId: ctx.turnId,
+        parentSpawnDepth: parentDepth,
+        persona: input.persona,
+        prompt: expanded.prompt,
+        allowedTools: expanded.allowedTools,
+        allowedSkills: expanded.allowedSkills,
+        timeoutMs,
+        abortSignal: ctx.abortSignal,
+        botId: ctx.botId,
+        workspaceRoot: ctx.workspaceRoot,
+        onAgentEvent: ctx.emitAgentEvent,
+      };
+
+      // T3-16 — tournament mode branches here. The tournament runner
+      // prepares its own per-variant spawnDirs; no single-spawn
+      // allocation on this path.
+      if (input.mode === "tournament") {
+        try {
+          const tourney = await runTournamentAdapter(input, ctx, agent, baseChildOptions);
+          // 2026-04-20 — hand off EVERY variant's artifacts (winner and
+          // losers alike) so partial work is never lost when
+          // `cleanup_losers` is true. Run sequentially to keep a stable
+          // parent-index append order.
+          const allHandedOff: SpawnHandoffArtifact[] = [];
+          for (const v of tourney.variants) {
+            const variantTaskId = `${taskId}.tournament-${v.variantIndex}`;
+            const variantArtifacts = await handOffChildArtifacts(
+              agent,
+              v.spawnDir,
+              variantTaskId,
+              ctx.emitAgentEvent,
+            );
+            allHandedOff.push(...variantArtifacts);
+          }
+          const winner = tourney.variants.find(
+            (v) => v.variantIndex === tourney.winnerIndex,
+          );
+          return {
+            status: "ok",
+            output: {
+              taskId,
+              status: "ok",
+              finalText: winner?.finalText ?? "",
+              mode: "tournament",
+              winnerIndex: tourney.winnerIndex,
+              variants: tourney.variants,
+              ...(allHandedOff.length > 0
+                ? {
+                    artifacts: {
+                      spawnDir: path.join(ctx.workspaceRoot, ".spawn"),
+                      fileCount: 0,
+                      handedOffArtifacts: allHandedOff,
+                    },
+                  }
+                : {}),
+            },
+            durationMs: Date.now() - start,
+          };
+        } catch (err) {
+          return errorResult(err, start);
+        }
+      }
+
+      // Single spawn — allocate ephemeral subdir before launching.
+      const prepared = await prepareSpawnDir(ctx.workspaceRoot, taskId).catch(
+        (err) => err,
+      );
+      if (prepared instanceof Error) {
+        return errorResult(prepared, start);
+      }
+      const { spawnDir, spawnWorkspace } = prepared;
+
+      ctx.emitAgentEvent?.({
+        type: "spawn_started",
+        taskId,
+        persona: input.persona,
+        prompt: input.prompt,
+        deliver: input.deliver,
+      });
+      ctx.emitAgentEvent?.({ type: "spawn_dir_created", taskId, spawnDir });
+      ctx.staging.stageAuditEvent("spawn_dir_created", { taskId, spawnDir });
+
+      const childOptions: SpawnChildOptions = {
+        ...baseChildOptions,
+        spawnDir,
+        spawnWorkspace,
+        taskId,
+      };
+
+      if (input.deliver === "return") {
+        try {
+          const result = await agent.spawnChildTurn(childOptions);
+          // 2026-04-20 — import child-produced artifacts BEFORE counting
+          // files / cleaning up so the child's artifacts/ subtree is
+          // scanned while still on disk.
+          const handedOffArtifacts = await handOffChildArtifacts(
+            agent,
+            spawnDir,
+            taskId,
+            ctx.emitAgentEvent,
+          );
+          const fileCount = await countFilesRecursive(spawnDir);
+          // Retention policy (2026-04-20): always retain spawnDir even
+          // when empty. Loss of the dir hides "child promised a file
+          // but didn't write it" cases — parent post-mortem needs the
+          // dir to exist to inspect. Cleanup is handled out-of-band
+          // (cron or manual). Prior behavior: rm -rf if fileCount===0,
+          // which silently hid the bug observed on admin bot
+          // 2026-04-20 where toolCallCount=24 but fileCount=0.
+          ctx.emitAgentEvent?.({
+            type: "spawn_dir_retained",
+            taskId,
+            spawnDir,
+            fileCount,
+          });
+          return {
+            status: "ok",
+            output: {
+              taskId,
+              status: result.status,
+              finalText: result.finalText,
+              toolCallCount: result.toolCallCount,
+              artifacts: { spawnDir, fileCount, handedOffArtifacts },
+            },
+            durationMs: Date.now() - start,
+          };
+        } catch (err) {
+          return errorResult(err, start);
+        }
+      }
+
+      // Background mode — fire-and-forget; emit spawn_result on completion.
+      await runBackgroundChild({
+        agent,
+        ctx,
+        taskId,
+        spawnDir,
+        childOptions,
+        backgroundRegistry,
+        input,
+      });
+      return {
+        status: "ok",
+        output: { taskId, status: "pending" },
+        durationMs: Date.now() - start,
+      };
+    },
+  };
+}
+
+// ── Background fire-and-forget runner ──────────────────────────────
+
+interface BackgroundRunArgs {
+  agent: Agent;
+  ctx: ToolContext;
+  taskId: string;
+  spawnDir: string;
+  childOptions: SpawnChildOptions;
+  backgroundRegistry?: BackgroundTaskRegistry;
+  input: SpawnAgentInput;
+}
+
+/**
+ * Background-mode runner. Owns lifecycle of a dedicated AbortController
+ * (so TaskStop can abort independently of the parent turn), registers
+ * with the BackgroundTaskRegistry, and emits the final spawn_result
+ * AgentEvent onto the parent SSE channel when the child finishes.
+ *
+ * Parent turn may have ended by the time the child finishes —
+ * SseWriter.ended guards against post-end writes.
+ */
+async function runBackgroundChild(args: BackgroundRunArgs): Promise<void> {
+  const { agent, ctx, taskId, spawnDir, childOptions, backgroundRegistry, input } = args;
+  const emit = ctx.emitAgentEvent;
+
+  const bgController = new AbortController();
+  const onParentAbortBg = (): void => bgController.abort();
+  ctx.abortSignal.addEventListener("abort", onParentAbortBg, { once: true });
+  const bgChildOptions: SpawnChildOptions = {
+    ...childOptions,
+    abortSignal: bgController.signal,
+  };
+
+  if (backgroundRegistry) {
+    // Registry is best-effort; never fail the spawn on a persist error.
+    // Must await `create` BEFORE kicking off the child turn so later
+    // `attachResult` calls find the row (T2-10 invariant).
+    try {
+      await backgroundRegistry.create({
+        taskId,
+        parentTurnId: ctx.turnId,
+        sessionKey: ctx.sessionKey,
+        persona: input.persona,
+        prompt: input.prompt,
+        spawnDir,
+        abortController: bgController,
+      });
+    } catch {
+      /* ignore — registry is best-effort */
+    }
+  }
+
+  void agent
+    .spawnChildTurn(bgChildOptions)
+    .then(async (result) => {
+      // 2026-04-20 — hand off child-produced artifacts to the parent
+      // before we emit the final spawn_result so the parent sees them
+      // in the event payload (not just post-hoc on `list()`).
+      const handedOffArtifacts = await handOffChildArtifacts(
+        agent,
+        spawnDir,
+        taskId,
+        emit,
+      );
+      const fileCount = await countFilesRecursive(spawnDir);
+      emit?.({
+        type: "spawn_result",
+        taskId,
+        status: result.status,
+        finalText: result.finalText,
+        toolCallCount: result.toolCallCount,
+        artifacts: { spawnDir, fileCount, handedOffArtifacts },
+        ...(result.errorMessage ? { errorMessage: result.errorMessage } : {}),
+      });
+      if (backgroundRegistry) {
+        const mappedStatus =
+          result.status === "ok"
+            ? "completed"
+            : result.status === "aborted"
+              ? "aborted"
+              : "failed";
+        await backgroundRegistry
+          .attachResult(taskId, {
+            status: mappedStatus,
+            resultText: result.finalText,
+            toolCallCount: result.toolCallCount,
+            ...(result.errorMessage ? { error: result.errorMessage } : {}),
+          })
+          .catch(() => {
+            /* ignore persist errors */
+          });
+      }
+    })
+    .catch(async (err: unknown) => {
+      const msg = err instanceof Error ? err.message : String(err);
+      emit?.({
+        type: "spawn_result",
+        taskId,
+        status: "error",
+        finalText: "",
+        toolCallCount: 0,
+        errorMessage: msg,
+      });
+      if (backgroundRegistry) {
+        await backgroundRegistry
+          .attachResult(taskId, { status: "failed", error: msg })
+          .catch(() => {
+            /* ignore */
+          });
+      }
+    })
+    .finally(() => {
+      ctx.abortSignal.removeEventListener("abort", onParentAbortBg);
+    });
+}
+
+/** Re-export for tests. */
+export { IToolRegistry };

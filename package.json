@@ -1,0 +1,60 @@
+{
+  "name": "clawy-agent",
+  "version": "0.1.0",
+  "description": "Autonomous task runtime with agentic interaction. Open-source, multi-provider, programmable.",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "bin": {
+    "clawy-agent": "./dist/cli/index.js"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "start": "node dist/index.js",
+    "dev": "tsx watch src/index.ts",
+    "cli": "tsx src/cli/index.ts",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "lint": "tsc --noEmit",
+    "prepublishOnly": "npm run build"
+  },
+  "engines": {
+    "node": ">=22"
+  },
+  "keywords": [
+    "ai-agent",
+    "autonomous",
+    "agentic",
+    "llm",
+    "claude",
+    "openai",
+    "gemini",
+    "task-runtime",
+    "hooks",
+    "multi-provider"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/ClawyPro/clawy-agent.git"
+  },
+  "homepage": "https://github.com/ClawyPro/clawy-agent",
+  "bugs": {
+    "url": "https://github.com/ClawyPro/clawy-agent/issues"
+  },
+  "license": "Apache-2.0",
+  "dependencies": {
+    "discord.js": "^14.26.3",
+    "ulid": "^2.3.0",
+    "yaml": "^2.8.3"
+  },
+  "optionalDependencies": {
+    "@anthropic-ai/sdk": "^0.39.0",
+    "openai": "^4.77.0",
+    "@google/generative-ai": "^0.21.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.7.5",
+    "tsx": "^4.19.1",
+    "typescript": "^5.6.3",
+    "vitest": "^2.1.2"
+  }
+}

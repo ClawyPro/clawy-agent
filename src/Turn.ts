@@ -1,0 +1,444 @@
+/**
+ * Turn — atomic transaction lifecycle (§5.3 / §6-A invariant A).
+ *
+ * Thin coordinator after R3. Real work lives in `turn/*`:
+ *   LLMStreamReader | ToolDispatcher | MessageBuilder | StopReasonHandler
+ *   CommitPipeline | ToolSelector | AskUserController | HookContextBuilder
+ */
+
+import type { Session } from "./Session.js";
+import type { UserMessage } from "./util/types.js";
+import type { SseWriter } from "./transport/SseWriter.js";
+import type { LLMContentBlock, LLMMessage, LLMUsage } from "./transport/LLMClient.js";
+import type { AskUserQuestionOutput } from "./Tool.js";
+import type { HookPoint } from "./hooks/types.js";
+import { computeUsd } from "./llm/modelCapabilities.js";
+import { buildSystemPrompt, buildMessages } from "./turn/MessageBuilder.js";
+import { readOne as readOneStream } from "./turn/LLMStreamReader.js";
+import { dispatch as dispatchTools, type ToolDispatchResult, UnknownToolLoopError } from "./turn/ToolDispatcher.js";
+import { handle as handleStopReason } from "./turn/StopReasonHandler.js";
+import { commit as commitTurn, abort as abortTurn, type CommitPipelineContext } from "./turn/CommitPipeline.js";
+import { buildToolDefs } from "./turn/ToolSelector.js";
+import { AskUserController } from "./turn/AskUserController.js";
+import { buildHookContext } from "./turn/HookContextBuilder.js";
+import { HeartbeatMonitor, wrapSseWithMonitor } from "./turn/HeartbeatMonitor.js";
+import { SessionHeartbeat } from "./turn/SessionHeartbeat.js";
+import type { TurnRoute, TurnStatus, TurnMeta, PlanResult, VerificationReport } from "./turn/types.js";
+
+// Re-exports for callers + tests.
+export type { TurnRoute, TurnStatus, TurnMeta, PlanResult, VerificationReport, TurnResult } from "./turn/types.js";
+export { PLAN_MODE_ALLOWED_TOOLS } from "./turn/ToolSelector.js";
+export { MAX_OUTPUT_TOKENS_RECOVERY_LIMIT, classifyStopReason, type StopReasonCase } from "./turn/StopReasonHandler.js";
+
+/** Case-insensitive `[PLAN_MODE: on]` header trigger. */
+export const PLAN_MODE_HEADER_RE = /\[PLAN_MODE:\s*on\]/i;
+
+export class Turn {
+  readonly meta: TurnMeta;
+  /**
+   * Max tool-use iterations per turn (bounds runaway loops).
+   * 2026-04-20 0.17.1: bumped 25 → 200 for Claude Code parity. Admin
+   * bot hit 17/25 on POS deep-dive and couldn't finish analysis+report
+   * after data collection. 200 matches Claude Code's effective no-cap.
+   * Env override: CORE_AGENT_MAX_TURN_ITERATIONS (clamped to 5..1000).
+   */
+  private static readonly MAX_ITERATIONS = (() => {
+    const raw = process.env.CORE_AGENT_MAX_TURN_ITERATIONS;
+    const parsed = raw !== undefined ? Number.parseInt(raw, 10) : NaN;
+    return Number.isFinite(parsed) && parsed >= 5 && parsed <= 1000 ? parsed : 200;
+  })();
+
+  private planMode = false;
+  private readonly asks: AskUserController;
+
+  private assistantText = "";
+  private emittedAssistantBlocks: LLMContentBlock[] = [];
+  private recoveryAttempt = 0;
+  /** Separate counter for empty-response recovery (thinking-only or
+   * tool_use-only turns where no text block was emitted). Independent
+   * from max_tokens recoveryAttempt so the two don't interfere. */
+  private emptyResponseRetry = 0;
+  static readonly MAX_EMPTY_RESPONSE_RETRIES = 3;
+  /** Counter for truncated responses (text ends mid-sentence). */
+  private truncationRecovery = 0;
+  static readonly MAX_TRUNCATION_RETRIES = 2;
+  /** When true, the next LLM call disables thinking to force text output. */
+  private forceNoThinking = false;
+  /** Gap §11.3 unknown-tool hallucination counter — shared across every
+   * dispatchTools call within this turn. */
+  private unknownToolCount = 0;
+  readonly commitRetryCount = 0;
+
+  constructor(
+    readonly session: Session,
+    readonly userMessage: UserMessage,
+    turnId: string,
+    readonly sse: SseWriter,
+    declaredRoute: TurnRoute = "direct",
+    options: { planMode?: boolean } = {},
+  ) {
+    this.meta = {
+      turnId,
+      sessionKey: session.meta.sessionKey,
+      startedAt: Date.now(),
+      declaredRoute,
+      status: "pending",
+      usage: { inputTokens: 0, outputTokens: 0, costUsd: 0 },
+    };
+    this.asks = new AskUserController(turnId, sse);
+    // T2-08 — Session permission mode is authoritative.
+    const sessionInPlan = safeGetPermissionMode(session) === "plan";
+    this.planMode =
+      sessionInPlan ||
+      options.planMode === true ||
+      PLAN_MODE_HEADER_RE.test(userMessage.text);
+    if (this.planMode && !sessionInPlan && typeof session.setPermissionMode === "function") {
+      session.setPermissionMode("plan");
+    }
+  }
+
+  // ── plan-mode surface ────────────────────────────────────────────
+  isPlanMode(): boolean {
+    return safeGetPermissionMode(this.session) === "plan" || this.planMode;
+  }
+
+  exitPlanMode(): void {
+    this.planMode = false;
+    if (typeof this.session.exitPlanMode === "function") {
+      this.session.exitPlanMode();
+    }
+  }
+
+  // ── askUser surface ──────────────────────────────────────────────
+  resolveAsk(questionId: string, answer: AskUserQuestionOutput): boolean {
+    return this.asks.resolve(questionId, answer);
+  }
+
+  // ── lifecycle ────────────────────────────────────────────────────
+  async plan(): Promise<PlanResult | null> { return null; }
+  async verify(): Promise<VerificationReport> { return { ok: true, violations: [] }; }
+
+  /** Read-only accessor used by T1-04 test harness. */
+  getRecoveryAttempt(): number { return this.recoveryAttempt; }
+
+  async execute(): Promise<void> {
+    this.sse.agent({ type: "turn_start", turnId: this.meta.turnId, declaredRoute: this.meta.declaredRoute });
+    const preStart = await this.session.agent.hooks.runPre(
+      "beforeTurnStart",
+      { userMessage: this.userMessage.text },
+      this.hookCtx("beforeTurnStart"),
+    );
+    if (preStart.action === "block") {
+      const reason = preStart.reason ?? "Turn blocked by hook";
+      this.sse.agent({ type: "text_delta", delta: `⚠️ ${reason}` });
+      throw new Error(`beforeTurnStart blocked: ${reason}`);
+    }
+    this.setPhase("executing");
+    this.checkBudgetOrThrow();
+    await this.appendTurnPrologue();
+
+    let systemPrompt = await buildSystemPrompt(this.session, this.meta.turnId);
+    let messages = await buildMessages(this.session, this.userMessage);
+    // B5 — heartbeat monitor wraps this.sse so every downstream SSE
+    // emission pings the silence timer. Long-running tool calls + LLM
+    // streams that go silent > 20s produce `heartbeat` events on a
+    // 30s cadence until activity resumes.
+    const heartbeat = new HeartbeatMonitor({ sse: this.sse, turnId: this.meta.turnId });
+    const sse = wrapSseWithMonitor(this.sse, heartbeat);
+    // B5 session-alive heartbeat file — writes heartbeat.json every 10s
+    // so external callers can cheaply verify session liveness.
+    const sessionHeartbeat = new SessionHeartbeat({
+      workspaceRoot: this.session.agent.config.workspaceRoot,
+      sessionKey: this.session.meta.sessionKey,
+    });
+    let toolDefs = await buildToolDefs({
+      session: this.session, sse, turnId: this.meta.turnId,
+      userText: this.userMessage.text,
+      planMode: this.planMode || safeGetPermissionMode(this.session) === "plan",
+    });
+
+    try {
+      for (let iter = 0; iter < Turn.MAX_ITERATIONS; iter++) {
+        heartbeat.start(iter);
+        if (iter === 0) {
+          await sessionHeartbeat.start(this.meta.turnId, iter).catch(() => {});
+        } else {
+          sessionHeartbeat.updateIteration(iter);
+        }
+        const preLLM = await this.session.agent.hooks.runPre(
+          "beforeLLMCall",
+          { messages, tools: toolDefs, system: systemPrompt, iteration: iter },
+          this.hookCtx("beforeLLMCall"),
+        );
+        if (preLLM.action === "block") {
+          const reason = preLLM.reason ?? "LLM call blocked by hook";
+          this.sse.agent({ type: "text_delta", delta: `⚠️ ${reason}` });
+          throw new Error(`beforeLLMCall blocked: ${reason}`);
+        }
+        if (preLLM.action === "skip") break;
+        ({ messages, tools: toolDefs, system: systemPrompt } = preLLM.args);
+
+        const { blocks, stopReason, usage } = await readOneStream(
+          { llm: this.session.agent.llm, model: this.session.agent.config.model, sse,
+            onError: (code, err) => this.emitError(code, err) },
+          systemPrompt, messages, toolDefs,
+          this.forceNoThinking ? { thinkingOverride: { type: "disabled" } } : undefined,
+        );
+        // Reset after use — only applies to the single recovery call.
+        this.forceNoThinking = false;
+        this.recordUsage(usage);
+        this.emittedAssistantBlocks.push(...blocks);
+
+        void this.session.agent.hooks.runPost(
+          "afterLLMCall",
+          { messages, tools: toolDefs, system: systemPrompt, iteration: iter, stopReason, assistantBlocks: blocks },
+          this.hookCtx("afterLLMCall"),
+        );
+
+        // T1-05 — StopReasonHandler mutates messages + stateRef.
+        const stateRef = { recoveryAttempt: this.recoveryAttempt, assistantTextSoFarLen: this.assistantTextSoFarLen() };
+        const decision = handleStopReason(
+          { stageAuditEvent: (e, d) => this.stageAuditEvent(e, d),
+            logUnknown: (raw, t) => console.warn(`[core-agent] unknown stop_reason=${String(raw)} turnId=${t}`) },
+          stateRef,
+          { stopReasonRaw: stopReason, blocks, iter, turnId: this.meta.turnId, messages },
+        );
+        this.recoveryAttempt = stateRef.recoveryAttempt;
+
+        // Diagnostic log — visible in `kubectl logs` for truncation / empty response debugging.
+        const textLen = this.emittedAssistantBlocks
+          .filter((b) => b.type === "text")
+          .reduce((sum, b) => sum + ((b as { text: string }).text?.length ?? 0), 0);
+        console.log(
+          `[core-agent] iter=${iter} stop=${String(stopReason)} decision=${decision.kind}` +
+          ` blocks=${blocks.length} textLen=${textLen}` +
+          ` in=${usage.inputTokens} out=${usage.outputTokens}` +
+          ` recovery=${this.recoveryAttempt} emptyRetry=${this.emptyResponseRetry}` +
+          ` turnId=${this.meta.turnId}`,
+        );
+
+        if (decision.kind === "finalise") {
+          // ── Guard 1: empty-response (no text at all) ──────────
+          // Covers: thinking-only, tool_use-only, subagent delegation.
+          const hasText = this.emittedAssistantBlocks.some((b) => b.type === "text");
+          if (!hasText && this.emptyResponseRetry < Turn.MAX_EMPTY_RESPONSE_RETRIES) {
+            messages.push({ role: "assistant", content: blocks });
+            const nudge = this.emptyResponseRetry === 0
+              ? "You completed your work but didn't produce a visible text response — the user sees an empty message. Please summarize what you did and your findings as text. Do NOT use thinking — write your summary directly as text."
+              : "Your response was still empty. The user CANNOT see your thinking — only text output is visible. Write a brief summary of what you did as plain text immediately.";
+            messages.push({ role: "user", content: nudge });
+            this.emptyResponseRetry += 1;
+            this.forceNoThinking = true; // Force text-only output on recovery
+            iter -= 1;
+            continue;
+          }
+
+          // ── Guard 2: truncated response (text ends mid-sentence) ──
+          // The model sent end_turn but the response looks cut off.
+          // This catches cases where thinking consumed most of the
+          // output budget, leaving too few tokens for the text body.
+          if (hasText && this.truncationRecovery < Turn.MAX_TRUNCATION_RETRIES) {
+            const lastTextBlock = [...this.emittedAssistantBlocks]
+              .reverse()
+              .find((b) => b.type === "text") as { text: string } | undefined;
+            const lastText = lastTextBlock?.text?.trimEnd() ?? "";
+            const lastChar = lastText.slice(-1);
+            // Terminal punctuation signals a complete sentence.
+            const TERMINAL_RE = /[.!?。！？…\n\r)）」』】]$/;
+            // Skip guard if response is very short (likely intentional)
+            // or already ends with terminal punctuation.
+            if (lastText.length > 200 && !TERMINAL_RE.test(lastChar)) {
+              console.log(
+                `[core-agent] truncation-guard fired: lastChar=${JSON.stringify(lastChar)}` +
+                ` textLen=${lastText.length} retry=${this.truncationRecovery}`,
+              );
+              messages.push({ role: "assistant", content: blocks });
+              messages.push({ role: "user", content: "Your response was cut off mid-sentence. Continue from where you left off." });
+              this.truncationRecovery += 1;
+              iter -= 1;
+              continue;
+            }
+          }
+          return;
+        }
+        if (decision.kind === "recover") { iter -= 1; continue; }
+        // decision.kind === "run_tools"
+        let dispatched: ToolDispatchResult[];
+        try {
+          dispatched = await this.runToolsVia(sse, decision.toolUses, toolDefs);
+        } catch (err) {
+          if (err instanceof UnknownToolLoopError) {
+            // Gap §11.3 — hallucination loop. Stop_reason + SSE text
+            // already emitted by the dispatcher; abort the turn.
+            this.stageAuditEvent("turn_aborted", {
+              reason: "unknown_tool_loop",
+              unknownToolCount: err.unknownToolCount,
+              iter,
+            });
+            throw err;
+          }
+          throw err;
+        }
+        this.appendToolTurn(messages, blocks, dispatched);
+      }
+
+      const err = new Error(`turn exceeded ${Turn.MAX_ITERATIONS} tool iterations`);
+      this.emitError("iteration_limit", err);
+      throw err;
+    } finally {
+      heartbeat.stop();
+      await sessionHeartbeat.stop().catch(() => {});
+    }
+  }
+
+  async commit(): Promise<void> { await commitTurn(this.buildCommitCtx()); }
+  async abort(reason: string): Promise<void> { await abortTurn(this.buildCommitCtx(), reason); }
+
+  // ── internals ────────────────────────────────────────────────────
+
+  private hookCtx(point: HookPoint) {
+    return buildHookContext(this.session, this.sse, this.meta.turnId, point);
+  }
+
+  private checkBudgetOrThrow(): void {
+    const budget = this.session.budgetExceeded();
+    if (!budget.exceeded) return;
+    const reason = budget.reason ?? "unknown";
+    const userFacing = `Session budget exceeded (${reason}). Please start a new session.`;
+    this.sse.agent({ type: "text_delta", delta: userFacing });
+    this.session.agent.auditLog
+      .append("session_budget_exceeded", this.session.meta.sessionKey, this.meta.turnId, {
+        reason,
+        ...this.session.budgetStats(),
+        maxTurns: this.session.maxTurns,
+        maxCostUsd: this.session.maxCostUsd,
+      })
+      .catch(() => { /* audit failures never abort — §6 invariant G */ });
+    throw new Error(userFacing);
+  }
+
+  /** Persist turn_started + user_message BEFORE any LLM call (invariant F). */
+  private async appendTurnPrologue(): Promise<void> {
+    const ts = Date.now();
+    await this.session.transcript.append({
+      kind: "turn_started", ts, turnId: this.meta.turnId, declaredRoute: this.meta.declaredRoute,
+    });
+    await this.session.transcript.append({
+      kind: "user_message", ts, turnId: this.meta.turnId, text: this.userMessage.text,
+    });
+  }
+
+  private appendToolTurn(
+    messages: LLMMessage[],
+    blocks: LLMContentBlock[],
+    results: ToolDispatchResult[],
+  ): void {
+    messages.push({ role: "assistant", content: blocks });
+    messages.push({
+      role: "user",
+      content: results.map((r) => ({
+        type: "tool_result" as const,
+        tool_use_id: r.toolUseId,
+        content: r.content,
+        ...(r.isError ? { is_error: true as const } : {}),
+      })),
+    });
+  }
+
+  private async runTools(
+    toolUses: Array<Extract<LLMContentBlock, { type: "tool_use" }>>,
+  ): Promise<ToolDispatchResult[]> {
+    return this.runToolsVia(this.sse, toolUses);
+  }
+
+  /** Variant used by the heartbeat-wrapped iteration loop so the
+   * heartbeat monitor sees every tool_start / tool_end emission. */
+  private async runToolsVia(
+    sse: SseWriter,
+    toolUses: Array<Extract<LLMContentBlock, { type: "tool_use" }>>,
+    toolDefs?: ReadonlyArray<{ name: string }>,
+  ): Promise<ToolDispatchResult[]> {
+    return dispatchTools(
+      {
+        session: this.session,
+        sse,
+        turnId: this.meta.turnId,
+        permissionMode: safeGetPermissionMode(this.session),
+        buildHookContext: (point) => this.hookCtx(point),
+        stageAuditEvent: (event, data) => this.stageAuditEvent(event, data),
+        askUser: (q) => this.asks.ask(q),
+        unknownToolCounter: {
+          get: () => this.unknownToolCount,
+          inc: () => ++this.unknownToolCount,
+        },
+        // Codex P1 (2026-04-20): pass the LLM-exposed tool set so the
+        // dispatcher enforces the allowlist and scopes its unknown-tool
+        // hint to names already visible to the LLM.
+        ...(toolDefs ? { exposedToolNames: toolDefs.map((d) => d.name) } : {}),
+      },
+      toolUses,
+    );
+  }
+
+  private recordUsage(u: LLMUsage): void {
+    this.meta.usage.inputTokens = Math.max(this.meta.usage.inputTokens, u.inputTokens);
+    this.meta.usage.outputTokens += u.outputTokens;
+    this.meta.usage.costUsd = computeUsd(
+      this.session.agent.config.model,
+      this.meta.usage.inputTokens,
+      this.meta.usage.outputTokens,
+    );
+  }
+
+  private buildCommitCtx(): CommitPipelineContext {
+    return {
+      session: this.session,
+      sse: this.sse,
+      userMessage: this.userMessage,
+      turnId: this.meta.turnId,
+      startedAt: this.meta.startedAt,
+      buildHookContext: (point) => this.hookCtx(point),
+      setPhase: (phase) => this.setPhase(phase),
+      meta: this.meta,
+      emittedAssistantBlocks: this.emittedAssistantBlocks,
+      commitRetryCount: this.commitRetryCount,
+      setAssistantText: (text) => { this.assistantText = text; },
+      rejectAllPendingAsks: (reason) => this.asks.rejectAll(reason),
+      getAssistantText: () => this.assistantText,
+    };
+  }
+
+  private setPhase(next: TurnStatus): void {
+    this.meta.status = next;
+    this.sse.agent({ type: "turn_phase", turnId: this.meta.turnId, phase: next });
+  }
+
+  private emitError(code: string, err: unknown): void {
+    const message = err instanceof Error ? err.message : String(err);
+    this.sse.agent({ type: "error", code, message });
+  }
+
+  /** Fire-and-forget audit event from within the turn loop (§6.G). */
+  private stageAuditEvent(event: string, data?: Record<string, unknown>): void {
+    void this.session.agent.auditLog.append(
+      event, this.session.meta.sessionKey, this.meta.turnId, data,
+    );
+  }
+
+  private assistantTextSoFarLen(): number {
+    let n = 0;
+    for (const b of this.emittedAssistantBlocks) if (b.type === "text") n += b.text.length;
+    return n;
+  }
+}
+
+/**
+ * Legacy test-stub safety: `getPermissionMode` may be absent (T2-08
+ * pre-existing stubs) — treat that as `"default"`.
+ */
+function safeGetPermissionMode(
+  session: { getPermissionMode?: () => "default" | "plan" | "auto" | "bypass" },
+): "default" | "plan" | "auto" | "bypass" {
+  if (typeof session.getPermissionMode !== "function") return "default";
+  return session.getPermissionMode();
+}

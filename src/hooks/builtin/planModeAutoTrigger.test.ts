@@ -1,0 +1,181 @@
+/**
+ * Unit tests for the plan-mode auto-trigger beforeLLMCall hook.
+ * Design ref: docs/plans/2026-04-20-superpowers-plugin-design.md design #1.
+ */
+
+import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
+import {
+  IMPLEMENTATION_INTENT_RE,
+  isAutoTriggerEnabled,
+  makePlanModeAutoTriggerHook,
+  matchesImplementationIntent,
+  type PlanModeAutoTriggerAgent,
+} from "./planModeAutoTrigger.js";
+import type { HookContext } from "../types.js";
+import type { LLMMessage } from "../../transport/LLMClient.js";
+import type { PermissionMode } from "../../Session.js";
+
+function makeCtx(sessionKey = "s1"): HookContext {
+  return {
+    botId: "bot-test",
+    userId: "user-test",
+    sessionKey,
+    turnId: "turn-1",
+    llm: {} as never,
+    transcript: [],
+    emit: vi.fn(),
+    log: vi.fn(),
+    abortSignal: new AbortController().signal,
+    deadlineMs: 10_000,
+  };
+}
+
+function buildArgs(
+  text: string,
+  iteration = 0,
+): {
+  messages: LLMMessage[];
+  tools: [];
+  system: string;
+  iteration: number;
+} {
+  return {
+    messages: [
+      {
+        role: "user",
+        content: [{ type: "text", text }],
+      } as LLMMessage,
+    ],
+    tools: [],
+    system: "you are a bot",
+    iteration,
+  };
+}
+
+function agentWith(mode: PermissionMode | null): PlanModeAutoTriggerAgent {
+  return {
+    getSessionPermissionMode: () => mode,
+  };
+}
+
+describe("IMPLEMENTATION_INTENT_RE", () => {
+  it("matches build/implement/add with a feature-ish noun", () => {
+    expect(matchesImplementationIntent("implement an endpoint for webhooks")).toBe(
+      true,
+    );
+    expect(matchesImplementationIntent("Build a new API route")).toBe(true);
+    expect(matchesImplementationIntent("Refactor the billing service")).toBe(
+      true,
+    );
+  });
+
+  it("does not match casual questions", () => {
+    expect(matchesImplementationIntent("what time is it")).toBe(false);
+    expect(matchesImplementationIntent("hello world")).toBe(false);
+    expect(matchesImplementationIntent("")).toBe(false);
+  });
+
+  it("is case-insensitive", () => {
+    expect(IMPLEMENTATION_INTENT_RE.test("WRITE A HANDLER")).toBe(true);
+  });
+});
+
+describe("isAutoTriggerEnabled", () => {
+  it("defaults on when env unset", () => {
+    expect(isAutoTriggerEnabled(undefined)).toBe(true);
+  });
+  it("off when explicitly disabled", () => {
+    expect(isAutoTriggerEnabled("off")).toBe(false);
+    expect(isAutoTriggerEnabled("false")).toBe(false);
+    expect(isAutoTriggerEnabled("0")).toBe(false);
+  });
+});
+
+describe("makePlanModeAutoTriggerHook", () => {
+  const prevEnv = process.env.CORE_AGENT_PLAN_AUTOTRIGGER;
+  beforeEach(() => {
+    delete process.env.CORE_AGENT_PLAN_AUTOTRIGGER;
+  });
+  afterEach(() => {
+    if (prevEnv === undefined) delete process.env.CORE_AGENT_PLAN_AUTOTRIGGER;
+    else process.env.CORE_AGENT_PLAN_AUTOTRIGGER = prevEnv;
+  });
+
+  it("declares name, point, priority, non-blocking", () => {
+    const hook = makePlanModeAutoTriggerHook({ agent: agentWith("default") });
+    expect(hook.name).toBe("builtin:plan-mode-auto-trigger");
+    expect(hook.point).toBe("beforeLLMCall");
+    expect(hook.priority).toBe(8);
+    expect(hook.blocking).toBe(false);
+  });
+
+  it("nudges when message has implementation intent", async () => {
+    const hook = makePlanModeAutoTriggerHook({ agent: agentWith("default") });
+    const result = await hook.handler(
+      buildArgs("please implement a new hook for invoicing"),
+      makeCtx(),
+    );
+    expect(result?.action).toBe("replace");
+    if (result?.action !== "replace") throw new Error("expected replace");
+    expect(result.value.system).toContain("plan_mode_nudge");
+    expect(result.value.system).toContain("you are a bot"); // preserved
+  });
+
+  it("continues silently when no implementation intent matched", async () => {
+    const hook = makePlanModeAutoTriggerHook({ agent: agentWith("default") });
+    const result = await hook.handler(
+      buildArgs("what's the weather today?"),
+      makeCtx(),
+    );
+    expect(result).toEqual({ action: "continue" });
+  });
+
+  it("skips when env gate is off", async () => {
+    process.env.CORE_AGENT_PLAN_AUTOTRIGGER = "off";
+    const hook = makePlanModeAutoTriggerHook({ agent: agentWith("default") });
+    const result = await hook.handler(
+      buildArgs("implement a new endpoint"),
+      makeCtx(),
+    );
+    expect(result).toEqual({ action: "continue" });
+  });
+
+  it("skips when session is already in plan mode", async () => {
+    const hook = makePlanModeAutoTriggerHook({ agent: agentWith("plan") });
+    const result = await hook.handler(
+      buildArgs("implement a new endpoint"),
+      makeCtx(),
+    );
+    expect(result).toEqual({ action: "continue" });
+  });
+
+  it("fails open when agent throws", async () => {
+    const hook = makePlanModeAutoTriggerHook({
+      agent: {
+        getSessionPermissionMode: () => {
+          throw new Error("boom");
+        },
+      },
+    });
+    const ctx = makeCtx();
+    const result = await hook.handler(
+      buildArgs("implement an API endpoint"),
+      ctx,
+    );
+    expect(result).toEqual({ action: "continue" });
+    expect(ctx.log).toHaveBeenCalledWith(
+      "warn",
+      "[plan-mode-auto-trigger] fail-open",
+      expect.any(Object),
+    );
+  });
+
+  it("does not nudge on iteration > 0", async () => {
+    const hook = makePlanModeAutoTriggerHook({ agent: agentWith("default") });
+    const result = await hook.handler(
+      buildArgs("implement a new feature", 2),
+      makeCtx(),
+    );
+    expect(result).toEqual({ action: "continue" });
+  });
+});

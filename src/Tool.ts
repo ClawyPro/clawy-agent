@@ -1,0 +1,130 @@
+/**
+ * Tool abstraction — borrowed shape from Claude Code's Tool.ts, trimmed.
+ * Design reference: §5.4.
+ *
+ * A Tool is the ONLY surface through which a Turn produces side-effects.
+ * All reads, writes, shell calls, and LLM-facing actions flow through
+ * tools so that the Turn's atomic-commit guarantee (invariant A) holds.
+ */
+
+import type { Workspace } from "./storage/Workspace.js";
+
+export type PermissionClass = "read" | "write" | "execute" | "net" | "meta";
+
+export type ToolStatus =
+  | "ok"
+  | "error"
+  | "empty"
+  | "permission_denied"
+  | "aborted";
+
+export interface ToolProgress {
+  label: string;
+  percent?: number;
+  etaMs?: number;
+}
+
+export interface AskUserQuestionInput {
+  question: string;
+  choices: { id: string; label: string; description?: string }[];
+  allowFreeText?: boolean;
+}
+
+export interface AskUserQuestionOutput {
+  selectedId?: string;
+  freeText?: string;
+}
+
+export interface ToolContext {
+  botId: string;
+  sessionKey: string;
+  turnId: string;
+  /** Workspace root; tools MUST scope all paths under this. */
+  workspaceRoot: string;
+  /** Called by the Tool when it needs the human in the loop. */
+  askUser(q: AskUserQuestionInput): Promise<AskUserQuestionOutput>;
+  emitProgress(p: ToolProgress): void;
+  /**
+   * Emit a richer AgentEvent on the SSE `event: agent` channel. Used
+   * by tools that produce structured live UI state (TaskBoard,
+   * artifact emitters, rule_check). Typed as `unknown` here to avoid
+   * a circular dep on SseWriter — call sites import AgentEvent.
+   */
+  emitAgentEvent?(event: unknown): void;
+  abortSignal: AbortSignal;
+  /** Per-turn staging surface — tools write here, not to disk directly. */
+  staging: StagingSurface;
+  /**
+   * Spawn depth — 0 for a top-level turn, 1 for a direct child spawned
+   * via SpawnAgent, 2 for a grandchild. `MAX_SPAWN_DEPTH` enforced by
+   * SpawnAgent (§7.12.d). Undefined is treated as 0.
+   */
+  spawnDepth?: number;
+  /**
+   * Present when this context belongs to a spawned child. Child tools
+   * should prefer `spawnWorkspace` over constructing paths from
+   * `workspaceRoot` directly — it is rooted at the ephemeral
+   * `workspace/.spawn/{childTurnId}/` subdirectory and enforces
+   * path-scope via `Workspace.resolve()`. Present only for spawned
+   * children; top-level turns leave this undefined.
+   *
+   * Audit 02 / PRE-01: the parent's tool closures still point at the
+   * parent `workspaceRoot`; promoting tools to consult this field is
+   * Tier-2 follow-up work. For now, the ephemeral subdir is the
+   * process-level isolation boundary: `allowed_tools` + spawnDir
+   * together scope a child's reach.
+   */
+  spawnWorkspace?: Workspace;
+}
+
+/**
+ * The Turn's StagedWriteJournal exposes this interface to tools. Any
+ * file write, transcript append, or audit entry goes through it so
+ * Turn.commit() can fsync everything atomically (see §6 invariant A).
+ */
+export interface StagingSurface {
+  stageFileWrite(relPath: string, content: string | Uint8Array): void;
+  stageTranscriptAppend(entry: object): void;
+  stageAuditEvent(event: string, data?: Record<string, unknown>): void;
+}
+
+export interface ToolResult<T = unknown> {
+  status: ToolStatus;
+  output?: T;
+  errorCode?: string;
+  errorMessage?: string;
+  durationMs: number;
+  metadata?: Record<string, unknown>;
+}
+
+export interface Tool<I = unknown, O = unknown> {
+  name: string;
+  description: string;
+  /** JSONSchema; validated by the runtime before execute(). */
+  inputSchema: object;
+  permission: PermissionClass;
+  outputSchema?: object;
+  /** Requires user consent even if permission class allows. */
+  dangerous?: boolean;
+  /** "core" tools are always loaded; "skill" tools go through intent
+   * filtering (§9.8 P2/P3). Defaults to "core" when unset. */
+  kind?: "core" | "skill";
+  /** Intent tags used by the classifier to decide whether to expose
+   * this tool in a given turn's tools[] (§9.8 P2). */
+  tags?: string[];
+  /** Optional pre-validation; return null if ok, string error if not. */
+  validate?(input: I): string | null;
+  execute(input: I, ctx: ToolContext): Promise<ToolResult<O>>;
+}
+
+export interface ToolRegistry {
+  register(tool: Tool): void;
+  resolve(name: string): Tool | null;
+  list(): Tool[];
+  /** Loads SKILL.md files under `dir` as tools. Returns count loaded. */
+  loadSkills(dir: string): Promise<number>;
+}
+
+export type ToolInput<T extends Tool> = T extends Tool<infer I, unknown>
+  ? I
+  : never;

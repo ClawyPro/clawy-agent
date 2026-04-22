@@ -1,0 +1,289 @@
+/**
+ * Tests for sessionResumeHook (Layer 4 meta-cognitive scaffolding).
+ */
+
+import { describe, it, expect, vi, afterEach, beforeEach } from "vitest";
+import fs from "node:fs/promises";
+import os from "node:os";
+import path from "node:path";
+import {
+  _clearSessionResumeMemo,
+  buildSessionResumeBlock,
+  extractRecentTurns,
+  makeSessionResumeHook,
+  type SessionResumeAgent,
+  type SessionResumeSnapshot,
+} from "./sessionResume.js";
+import type { HookContext } from "../types.js";
+import type { TranscriptEntry } from "../../storage/Transcript.js";
+
+function makeCtx(sessionKey = "sess-1"): HookContext {
+  return {
+    botId: "bot-test",
+    userId: "user-test",
+    sessionKey,
+    turnId: "turn-new",
+    llm: {} as never,
+    transcript: [],
+    emit: vi.fn(),
+    log: vi.fn(),
+    abortSignal: new AbortController().signal,
+    deadlineMs: 10_000,
+  };
+}
+
+function makeAgent(
+  snapshotProvider: (sessionKey: string) => SessionResumeSnapshot | null,
+): { agent: SessionResumeAgent; appended: { sessionKey: string; seed: string }[] } {
+  const appended: { sessionKey: string; seed: string }[] = [];
+  const agent: SessionResumeAgent = {
+    getResumeSnapshot: async (sessionKey) => snapshotProvider(sessionKey),
+    appendResumeSeed: async (sessionKey, seed) => {
+      appended.push({ sessionKey, seed });
+    },
+  };
+  return { agent, appended };
+}
+
+async function mkTmpWorkspace(): Promise<string> {
+  return await fs.mkdtemp(path.join(os.tmpdir(), "session-resume-"));
+}
+
+afterEach(() => {
+  delete process.env.CORE_AGENT_SESSION_RESUME_SEED;
+  _clearSessionResumeMemo();
+});
+
+beforeEach(() => {
+  _clearSessionResumeMemo();
+});
+
+describe("extractRecentTurns", () => {
+  it("only returns committed turns with user+assistant pairs", () => {
+    const transcript: TranscriptEntry[] = [
+      { kind: "user_message", ts: 1, turnId: "t1", text: "hi" },
+      { kind: "assistant_text", ts: 2, turnId: "t1", text: "hello" },
+      { kind: "turn_committed", ts: 3, turnId: "t1", inputTokens: 1, outputTokens: 1 },
+
+      { kind: "user_message", ts: 4, turnId: "t2", text: "uncommitted q" },
+      { kind: "assistant_text", ts: 5, turnId: "t2", text: "uncommitted a" },
+      // no turn_committed for t2
+
+      { kind: "user_message", ts: 6, turnId: "t3", text: "second committed" },
+      { kind: "assistant_text", ts: 7, turnId: "t3", text: "second a" },
+      { kind: "turn_committed", ts: 8, turnId: "t3", inputTokens: 1, outputTokens: 1 },
+    ];
+    const turns = extractRecentTurns(transcript, 3);
+    expect(turns.map((t) => t.turnId)).toEqual(["t1", "t3"]);
+    expect(turns[0]?.user).toBe("hi");
+    expect(turns[0]?.assistant).toBe("hello");
+  });
+
+  it("returns at most `maxPairs` most-recent turns", () => {
+    const entries: TranscriptEntry[] = [];
+    for (let i = 0; i < 5; i++) {
+      entries.push(
+        { kind: "user_message", ts: i * 3, turnId: `t${i}`, text: `q${i}` },
+        { kind: "assistant_text", ts: i * 3 + 1, turnId: `t${i}`, text: `a${i}` },
+        { kind: "turn_committed", ts: i * 3 + 2, turnId: `t${i}`, inputTokens: 1, outputTokens: 1 },
+      );
+    }
+    const turns = extractRecentTurns(entries, 3);
+    expect(turns.map((t) => t.turnId)).toEqual(["t2", "t3", "t4"]);
+  });
+});
+
+describe("buildSessionResumeBlock", () => {
+  it("truncates long messages to 800 chars with ellipsis", async () => {
+    const long = "x".repeat(2000);
+    const snapshot: SessionResumeSnapshot = {
+      transcript: [
+        { kind: "user_message", ts: 1, turnId: "t1", text: long },
+        { kind: "assistant_text", ts: 2, turnId: "t1", text: long },
+        { kind: "turn_committed", ts: 3, turnId: "t1", inputTokens: 1, outputTokens: 1 },
+      ],
+      lastActivityAt: Date.now(),
+    };
+    const root = await mkTmpWorkspace();
+    try {
+      const block = await buildSessionResumeBlock(snapshot, root);
+      expect(block).toContain("<session_resume>");
+      expect(block).toContain("</session_resume>");
+      expect(block).toContain("…");
+      // Bound total user line ~ 800 + "User: " overhead.
+      const userLine = block.split("\n").find((l) => l.startsWith("User:"));
+      expect(userLine).toBeTruthy();
+      expect(userLine!.length).toBeLessThanOrEqual(900);
+    } finally {
+      await fs.rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("returns empty string when no turns and no recent files", async () => {
+    const root = await mkTmpWorkspace();
+    try {
+      const snapshot: SessionResumeSnapshot = {
+        transcript: [],
+        lastActivityAt: Date.now(),
+      };
+      const block = await buildSessionResumeBlock(snapshot, root);
+      expect(block).toBe("");
+    } finally {
+      await fs.rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("includes recently-modified files within 24h of last activity", async () => {
+    const root = await mkTmpWorkspace();
+    try {
+      const now = Date.now();
+      await fs.writeFile(path.join(root, "fresh.md"), "x");
+      await fs.utimes(path.join(root, "fresh.md"), new Date(now - 1000), new Date(now - 1000));
+      await fs.writeFile(path.join(root, "stale.md"), "y");
+      const longAgo = new Date(now - 7 * 24 * 3600 * 1000);
+      await fs.utimes(path.join(root, "stale.md"), longAgo, longAgo);
+
+      const snapshot: SessionResumeSnapshot = {
+        transcript: [
+          { kind: "user_message", ts: 1, turnId: "t1", text: "hi" },
+          { kind: "assistant_text", ts: 2, turnId: "t1", text: "hello" },
+          { kind: "turn_committed", ts: 3, turnId: "t1", inputTokens: 1, outputTokens: 1 },
+        ],
+        lastActivityAt: now,
+      };
+      const block = await buildSessionResumeBlock(snapshot, root);
+      expect(block).toContain("fresh.md");
+      expect(block).not.toContain("stale.md");
+    } finally {
+      await fs.rm(root, { recursive: true, force: true });
+    }
+  });
+});
+
+describe("sessionResumeHook", () => {
+  it("declares name, point, priority 2, non-blocking", () => {
+    const { agent } = makeAgent(() => null);
+    const hook = makeSessionResumeHook({ agent, workspaceRoot: "/tmp" });
+    expect(hook.name).toBe("builtin:session-resume");
+    expect(hook.point).toBe("beforeTurnStart");
+    expect(hook.priority).toBe(2);
+    expect(hook.blocking).toBe(false);
+  });
+
+  it("no-ops on fresh session (snapshot returns null)", async () => {
+    const root = await mkTmpWorkspace();
+    try {
+      const { agent, appended } = makeAgent(() => null);
+      const hook = makeSessionResumeHook({ agent, workspaceRoot: root });
+      const result = await hook.handler({ userMessage: "hi" }, makeCtx());
+      expect(result).toEqual({ action: "continue" });
+      expect(appended).toHaveLength(0);
+    } finally {
+      await fs.rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("seeds on first turn post-resume, memoises after", async () => {
+    const root = await mkTmpWorkspace();
+    try {
+      const snapshot: SessionResumeSnapshot = {
+        transcript: [
+          { kind: "user_message", ts: 1, turnId: "t1", text: "prior question" },
+          { kind: "assistant_text", ts: 2, turnId: "t1", text: "prior answer" },
+          { kind: "turn_committed", ts: 3, turnId: "t1", inputTokens: 1, outputTokens: 1 },
+        ],
+        lastActivityAt: Date.now(),
+      };
+      let calls = 0;
+      const { agent, appended } = makeAgent(() => {
+        calls++;
+        return snapshot;
+      });
+      const hook = makeSessionResumeHook({ agent, workspaceRoot: root });
+
+      const r1 = await hook.handler({ userMessage: "new q" }, makeCtx("sess-1"));
+      expect(r1).toEqual({ action: "continue" });
+      expect(appended).toHaveLength(1);
+      expect(appended[0]?.seed).toContain("<session_resume>");
+      expect(appended[0]?.seed).toContain("prior question");
+
+      // Second call on same session — no re-seed.
+      const r2 = await hook.handler({ userMessage: "another" }, makeCtx("sess-1"));
+      expect(r2).toEqual({ action: "continue" });
+      expect(appended).toHaveLength(1);
+      // Agent should NOT have been re-queried after memoisation.
+      expect(calls).toBe(1);
+    } finally {
+      await fs.rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("no-ops when transcript is empty", async () => {
+    const root = await mkTmpWorkspace();
+    try {
+      const { agent, appended } = makeAgent(() => ({
+        transcript: [],
+        lastActivityAt: Date.now(),
+      }));
+      const hook = makeSessionResumeHook({ agent, workspaceRoot: root });
+      const result = await hook.handler({ userMessage: "hi" }, makeCtx());
+      expect(result).toEqual({ action: "continue" });
+      expect(appended).toHaveLength(0);
+    } finally {
+      await fs.rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("respects CORE_AGENT_SESSION_RESUME_SEED=off", async () => {
+    process.env.CORE_AGENT_SESSION_RESUME_SEED = "off";
+    const root = await mkTmpWorkspace();
+    try {
+      const snapshot: SessionResumeSnapshot = {
+        transcript: [
+          { kind: "user_message", ts: 1, turnId: "t1", text: "hi" },
+          { kind: "assistant_text", ts: 2, turnId: "t1", text: "hello" },
+          { kind: "turn_committed", ts: 3, turnId: "t1", inputTokens: 1, outputTokens: 1 },
+        ],
+        lastActivityAt: Date.now(),
+      };
+      const { agent, appended } = makeAgent(() => snapshot);
+      const hook = makeSessionResumeHook({ agent, workspaceRoot: root });
+      const result = await hook.handler({ userMessage: "hi" }, makeCtx());
+      expect(result).toEqual({ action: "continue" });
+      expect(appended).toHaveLength(0);
+    } finally {
+      await fs.rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("fail-open when appendResumeSeed throws", async () => {
+    const root = await mkTmpWorkspace();
+    try {
+      const snapshot: SessionResumeSnapshot = {
+        transcript: [
+          { kind: "user_message", ts: 1, turnId: "t1", text: "hi" },
+          { kind: "assistant_text", ts: 2, turnId: "t1", text: "hello" },
+          { kind: "turn_committed", ts: 3, turnId: "t1", inputTokens: 1, outputTokens: 1 },
+        ],
+        lastActivityAt: Date.now(),
+      };
+      const agent: SessionResumeAgent = {
+        getResumeSnapshot: async () => snapshot,
+        appendResumeSeed: async () => {
+          throw new Error("persist boom");
+        },
+      };
+      const hook = makeSessionResumeHook({ agent, workspaceRoot: root });
+      const ctx = makeCtx("sess-err");
+      const result = await hook.handler({ userMessage: "hi" }, ctx);
+      expect(result).toEqual({ action: "continue" });
+      expect(ctx.log).toHaveBeenCalledWith(
+        "warn",
+        expect.stringContaining("seed failed"),
+        expect.any(Object),
+      );
+    } finally {
+      await fs.rm(root, { recursive: true, force: true });
+    }
+  });
+});

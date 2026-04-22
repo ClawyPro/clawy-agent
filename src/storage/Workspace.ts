@@ -1,0 +1,165 @@
+/**
+ * Workspace — reads the bot's OpenClaw-compatible workspace directory.
+ * Design reference: §9.5.
+ *
+ * Core-agent mounts `/home/ocuser/.openclaw/workspace` — the same PVC
+ * shape existing OpenClaw bots have. We read identity/memory files for
+ * the layered context on each turn; writes happen through
+ * StagedWriteJournal (Phase 1c).
+ */
+
+import fs from "node:fs/promises";
+import path from "node:path";
+
+export interface WorkspaceIdentity {
+  /** BOOTSTRAP.md — short identity prologue rendered first in system. */
+  bootstrap?: string;
+  /** SOUL.md — main agent spec / persona / rules. */
+  soul?: string;
+  /** IDENTITY.md — extended bio / role definition. */
+  identity?: string;
+  /** USER.md — user profile (preferences, role, language). */
+  user?: string;
+  /** AGENTS.md — sub-persona registry (parsed later, not yet used). */
+  agents?: string;
+  /** TOOLS.md — documentation only, not enforcement. */
+  tools?: string;
+  /**
+   * USER-RULES.md — user-defined Agent Rules from the dashboard.
+   * Persisted to `bots.agent_rules` (migration 079) and written into the
+   * workspace by the provisioning-worker init container. Capped at 5000
+   * chars by the DB layer; the reader applies the same cap defensively.
+   */
+  userRules?: string;
+}
+
+/**
+ * Hard cap for `userRules` content (chars). Must match the DB/FE cap
+ * (`src/lib/validation/schemas.ts` — agent_rules.max(5000)). Applied here
+ * defensively in case the file on disk has been tampered with.
+ */
+export const USER_RULES_MAX_CHARS = 5000;
+
+export interface WorkspaceMemory {
+  /** MEMORY.md top-level index (hipocampus ROOT equivalent). */
+  rootIndex?: string;
+  /** Loaded lazily on demand — Phase 2 wires full hipocampus recall. */
+}
+
+export class Workspace {
+  constructor(readonly root: string) {}
+
+  async exists(): Promise<boolean> {
+    try {
+      const st = await fs.stat(this.root);
+      return st.isDirectory();
+    } catch {
+      return false;
+    }
+  }
+
+  private async readSafe(relPath: string): Promise<string | undefined> {
+    try {
+      const full = path.join(this.root, relPath);
+      const txt = await fs.readFile(full, "utf8");
+      return txt;
+    } catch {
+      return undefined;
+    }
+  }
+
+  async loadIdentity(): Promise<WorkspaceIdentity> {
+    const [bootstrap, soul, identity, user, agents, tools, userRulesRaw] =
+      await Promise.all([
+        this.readSafe("BOOTSTRAP.md"),
+        this.readSafe("SOUL.md"),
+        this.readSafe("IDENTITY.md"),
+        this.readSafe("USER.md"),
+        this.readSafe("AGENTS.md"),
+        this.readSafe("TOOLS.md"),
+        this.readSafe("USER-RULES.md"),
+      ]);
+    // Defensive cap — the DB/FE already caps at 5000 chars, but if a
+    // bot's PVC is tampered with (or the file is appended to by a skill
+    // over time) we truncate here so a malicious/oversized file can't
+    // balloon the system prompt. Truncation marker helps the model know
+    // content was cut.
+    let userRules: string | undefined;
+    if (typeof userRulesRaw === "string" && userRulesRaw.trim().length > 0) {
+      userRules =
+        userRulesRaw.length > USER_RULES_MAX_CHARS
+          ? `${userRulesRaw.slice(0, USER_RULES_MAX_CHARS)}\n[truncated]`
+          : userRulesRaw;
+    }
+    return { bootstrap, soul, identity, user, agents, tools, userRules };
+  }
+
+  async loadMemoryIndex(): Promise<WorkspaceMemory> {
+    const rootIndex = await this.readSafe("MEMORY.md");
+    return { rootIndex };
+  }
+
+  /**
+   * Resolve a path inside the workspace. Throws if the resolved path
+   * escapes the workspace root (path traversal defence — tools use
+   * this helper before any read/write).
+   */
+  resolve(relPath: string): string {
+    const normalised = path.normalize(relPath).replace(/^\/+/, "");
+    const full = path.join(this.root, normalised);
+    const root = path.resolve(this.root);
+    const resolved = path.resolve(full);
+    if (!resolved.startsWith(root + path.sep) && resolved !== root) {
+      throw new Error(`path escapes workspace: ${relPath}`);
+    }
+    return resolved;
+  }
+
+  /** Read a workspace-relative file as utf8 text (scope-checked). */
+  async readFile(relPath: string): Promise<string> {
+    const resolved = this.resolve(relPath);
+    return fs.readFile(resolved, "utf8");
+  }
+
+  /**
+   * Write a workspace-relative file (scope-checked). Parent dirs are
+   * created as needed.
+   */
+  async writeFile(relPath: string, content: string): Promise<void> {
+    const resolved = this.resolve(relPath);
+    await fs.mkdir(path.dirname(resolved), { recursive: true });
+    await fs.writeFile(resolved, content, "utf8");
+  }
+}
+
+/**
+ * Render the identity block into a single system-prompt string.
+ *
+ * Order (§9.5 + SOUL.md convention):
+ *   BOOTSTRAP → SOUL → IDENTITY → USER → AGENTS → TOOLS
+ *
+ * Missing files are omitted, not replaced with "<missing>". Each file
+ * is wrapped in a clear section header so the model can distinguish.
+ */
+export function renderIdentitySystem(id: WorkspaceIdentity): string {
+  const parts: string[] = [];
+  const push = (label: string, body: string | undefined): void => {
+    if (!body || body.trim().length === 0) return;
+    parts.push(`# ${label}\n\n${body.trim()}`);
+  };
+  push("BOOTSTRAP", id.bootstrap);
+  push("SOUL", id.soul);
+  push("IDENTITY", id.identity);
+  push("USER", id.user);
+  push("AGENTS", id.agents);
+  push("TOOLS", id.tools);
+  // Agent Rules (user-defined, dashboard-sourced). Rendered as an XML-
+  // style `<agent_rules>` block rather than a `# USER-RULES` markdown
+  // section so the model can cleanly distinguish owner-provided
+  // behavioural rules from platform identity files. Block sits after the
+  // identity stack but before any live-state blocks a caller may append.
+  if (id.userRules && id.userRules.trim().length > 0) {
+    parts.push(`<agent_rules>\n${id.userRules.trim()}\n</agent_rules>`);
+  }
+  return parts.join("\n\n---\n\n");
+}

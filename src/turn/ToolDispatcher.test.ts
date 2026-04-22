@@ -1,0 +1,341 @@
+/**
+ * ToolDispatcher unit tests (R3 refactor).
+ *
+ * Stub hooks + tools + session, verify:
+ *   - beforeToolUse → afterToolUse order
+ *   - permission bypass skips beforeToolUse + emits audit
+ *   - hook block path writes permission_denied transcript + tool_end
+ *   - unknown tool path writes unknown_tool transcript + tool_end error
+ *   - parallel execution (two tools run concurrently)
+ */
+
+import { describe, it, expect } from "vitest";
+import fs from "node:fs/promises";
+import os from "node:os";
+import path from "node:path";
+import type { ServerResponse } from "node:http";
+import {
+  dispatch,
+  UnknownToolLoopError,
+  UNKNOWN_TOOL_LOOP_THRESHOLD,
+  type ToolDispatchContext,
+} from "./ToolDispatcher.js";
+import type { LLMContentBlock } from "../transport/LLMClient.js";
+import type { Session } from "../Session.js";
+import { Transcript } from "../storage/Transcript.js";
+import { SseWriter } from "../transport/SseWriter.js";
+import type { HookContext } from "../hooks/types.js";
+
+class FakeSse extends SseWriter {
+  readonly events: Array<Record<string, unknown>> = [];
+  constructor() {
+    super({
+      writeHead: () => {},
+      write: () => true,
+      end: () => {},
+    } as unknown as ServerResponse);
+  }
+  override agent(event: unknown): void {
+    this.events.push(event as Record<string, unknown>);
+  }
+  override legacyDelta(): void {}
+  override legacyFinish(): void {}
+  override start(): void {}
+  override end(): void {}
+}
+
+interface ToolRecord {
+  name: string;
+  calls: unknown[];
+  behaviour: "ok" | "throw" | "error-status";
+}
+
+interface HookRecord {
+  calls: Array<{ point: string; args: unknown }>;
+  // Optional override: if set, returns a block action for beforeToolUse.
+  blockReason?: string;
+}
+
+async function makeCtx(opts: {
+  tools: ToolRecord[];
+  permissionMode?: "default" | "plan" | "auto" | "bypass";
+  blockReason?: string;
+}): Promise<{
+  ctx: ToolDispatchContext;
+  sse: FakeSse;
+  transcript: Transcript;
+  auditEvents: Array<{ event: string; data?: Record<string, unknown> }>;
+  hooks: HookRecord;
+  session: Session;
+}> {
+  const workspaceRoot = await fs.mkdtemp(
+    path.join(os.tmpdir(), "tool-dispatcher-"),
+  );
+  const sessionsDir = path.join(workspaceRoot, "sessions");
+  await fs.mkdir(sessionsDir, { recursive: true });
+
+  const sse = new FakeSse();
+  const auditEvents: Array<{ event: string; data?: Record<string, unknown> }> = [];
+  const hooks: HookRecord = { calls: [] };
+  if (opts.blockReason !== undefined) hooks.blockReason = opts.blockReason;
+
+  const transcript = new Transcript(sessionsDir, "sess-key");
+
+  const toolRegistry = {
+    list: () => [],
+    resolve: (name: string) => {
+      const t = opts.tools.find((x) => x.name === name);
+      if (!t) return undefined;
+      return {
+        name: t.name,
+        kind: "builtin" as const,
+        description: t.name,
+        inputSchema: { type: "object", properties: {} },
+        execute: async (input: unknown) => {
+          t.calls.push(input);
+          if (t.behaviour === "throw") {
+            throw new Error("boom");
+          }
+          if (t.behaviour === "error-status") {
+            return {
+              status: "error" as const,
+              errorCode: "bad",
+              errorMessage: "bad",
+              durationMs: 1,
+            };
+          }
+          return { status: "ok" as const, durationMs: 1, output: `${t.name}-output` };
+        },
+      };
+    },
+  };
+
+  const agentStub = {
+    config: {
+      botId: "bot-test",
+      userId: "user-test",
+      workspaceRoot,
+      model: "test-model",
+    },
+    hooks: {
+      runPre: async (point: string, args: unknown) => {
+        hooks.calls.push({ point, args });
+        if (point === "beforeToolUse" && hooks.blockReason) {
+          return { action: "block" as const, reason: hooks.blockReason };
+        }
+        return { action: "continue" as const, args };
+      },
+      runPost: async (point: string, args: unknown) => {
+        hooks.calls.push({ point, args });
+      },
+      list: () => [],
+    },
+    tools: toolRegistry,
+    auditLog: {
+      append: async (
+        event: string,
+        _sk: string,
+        _tid: string | undefined,
+        data?: Record<string, unknown>,
+      ) => {
+        auditEvents.push({ event, ...(data !== undefined ? { data } : {}) });
+      },
+    },
+  };
+
+  const session = {
+    meta: { sessionKey: "sess-key" },
+    transcript,
+    agent: agentStub,
+  } as unknown as Session;
+
+  const ctx: ToolDispatchContext = {
+    session,
+    sse,
+    turnId: "turn-test",
+    permissionMode: opts.permissionMode ?? "default",
+    buildHookContext: () =>
+      ({
+        botId: "bot-test",
+        userId: "user-test",
+        sessionKey: "sess-key",
+        turnId: "turn-test",
+        llm: {} as HookContext["llm"],
+        transcript: [],
+        emit: () => {},
+        log: () => {},
+        abortSignal: new AbortController().signal,
+        deadlineMs: 1_000,
+      }) as HookContext,
+    stageAuditEvent: (event, data) => {
+      auditEvents.push({ event, ...(data !== undefined ? { data } : {}) });
+    },
+    askUser: async () => ({}),
+  };
+
+  return { ctx, sse, transcript, auditEvents, hooks, session };
+}
+
+function tu(id: string, name: string, input: unknown = {}): Extract<LLMContentBlock, { type: "tool_use" }> {
+  return { type: "tool_use", id, name, input };
+}
+
+describe("ToolDispatcher.dispatch", () => {
+  it("runs beforeToolUse → execute → afterToolUse in order", async () => {
+    const tool: ToolRecord = { name: "Echo", calls: [], behaviour: "ok" };
+    const { ctx, hooks } = await makeCtx({ tools: [tool] });
+    const results = await dispatch(ctx, [tu("tu_1", "Echo", { x: 1 })]);
+    expect(results.length).toBe(1);
+    expect(results[0]?.isError).toBe(false);
+    expect(tool.calls).toEqual([{ x: 1 }]);
+    const points = hooks.calls.map((c) => c.point);
+    expect(points).toEqual(["beforeToolUse", "afterToolUse"]);
+  });
+
+  it("bypass mode skips beforeToolUse and emits permission_bypass audit", async () => {
+    const tool: ToolRecord = { name: "Echo", calls: [], behaviour: "ok" };
+    const { ctx, hooks, auditEvents } = await makeCtx({
+      tools: [tool],
+      permissionMode: "bypass",
+    });
+    await dispatch(ctx, [tu("tu_1", "Echo", { x: 1 })]);
+    const preCalls = hooks.calls.filter((c) => c.point === "beforeToolUse");
+    expect(preCalls.length).toBe(0);
+    const bypass = auditEvents.find((e) => e.event === "permission_bypass");
+    expect(bypass?.data?.toolName).toBe("Echo");
+    // afterToolUse still observes.
+    expect(hooks.calls.some((c) => c.point === "afterToolUse")).toBe(true);
+  });
+
+  it("hook block → permission_denied tool_end + transcript, tool NOT executed", async () => {
+    const tool: ToolRecord = { name: "Bash", calls: [], behaviour: "ok" };
+    const { ctx, sse, transcript } = await makeCtx({
+      tools: [tool],
+      blockReason: "forbidden-tool",
+    });
+    const results = await dispatch(ctx, [tu("tu_1", "Bash")]);
+    expect(results[0]?.isError).toBe(true);
+    expect(results[0]?.content).toContain("forbidden-tool");
+    expect(tool.calls.length).toBe(0);
+    const ends = sse.events.filter((e) => e.type === "tool_end");
+    expect(ends[0]?.status).toBe("permission_denied");
+    const entries = await transcript.readAll();
+    const res = entries.find((e) => e.kind === "tool_result");
+    expect(res).toBeDefined();
+    expect((res as { status?: string }).status).toBe("permission_denied");
+  });
+
+  it("unknown tool → unknown_tool transcript + error tool_end", async () => {
+    const { ctx, sse, transcript } = await makeCtx({ tools: [] });
+    const results = await dispatch(ctx, [tu("tu_1", "NoSuchTool")]);
+    expect(results[0]?.isError).toBe(true);
+    const ends = sse.events.filter((e) => e.type === "tool_end");
+    expect(ends[0]?.status).toBe("error");
+    const entries = await transcript.readAll();
+    const res = entries.find((e) => e.kind === "tool_result");
+    expect((res as { status?: string }).status).toBe("unknown_tool");
+  });
+
+  it("tool that throws → maps to tool_threw error result", async () => {
+    const tool: ToolRecord = { name: "Bad", calls: [], behaviour: "throw" };
+    const { ctx, sse } = await makeCtx({ tools: [tool] });
+    const results = await dispatch(ctx, [tu("tu_1", "Bad")]);
+    expect(results[0]?.isError).toBe(true);
+    const ends = sse.events.filter((e) => e.type === "tool_end");
+    expect(ends[0]?.status).toBe("error");
+  });
+
+  it("runs multiple tool_use blocks in parallel", async () => {
+    const a: ToolRecord = { name: "A", calls: [], behaviour: "ok" };
+    const b: ToolRecord = { name: "B", calls: [], behaviour: "ok" };
+    const { ctx } = await makeCtx({ tools: [a, b] });
+    const results = await dispatch(ctx, [tu("tu_a", "A"), tu("tu_b", "B")]);
+    expect(results.length).toBe(2);
+    expect(a.calls.length).toBe(1);
+    expect(b.calls.length).toBe(1);
+  });
+});
+
+describe("ToolDispatcher unknown-tool loop guard (Gap §11.3)", () => {
+  it("enriches unknown_tool output with 'Available tools: ...'", async () => {
+    const ok: ToolRecord = { name: "Echo", calls: [], behaviour: "ok" };
+    const { ctx } = await makeCtx({ tools: [ok] });
+    // Inject a fake list() on the registry by re-wiring session.agent.tools.
+    (ctx.session.agent as unknown as {
+      tools: { list: () => Array<{ name: string }>; resolve: (n: string) => unknown };
+    }).tools = {
+      list: () => [{ name: "Echo" }, { name: "Bash" }],
+      resolve: (n: string) => (n === "Echo" ? {
+        name: "Echo",
+        execute: async () => ({ status: "ok", durationMs: 1, output: "ok" }),
+      } : undefined),
+    };
+    const counter = { get: () => n, inc: () => ++n };
+    let n = 0;
+    const out = await dispatch(
+      { ...ctx, unknownToolCounter: counter },
+      [tu("u1", "NoSuchTool")],
+    );
+    expect(out[0]?.content).toContain("Unknown tool: NoSuchTool");
+    expect(out[0]?.content).toContain("Available tools:");
+    expect(out[0]?.content).toContain("Echo");
+    expect(out[0]?.content).toContain("Bash");
+  });
+
+  it("counter increments on every unknown dispatch", async () => {
+    const { ctx } = await makeCtx({ tools: [] });
+    let n = 0;
+    const counter = { get: () => n, inc: () => ++n };
+    await dispatch({ ...ctx, unknownToolCounter: counter }, [tu("u1", "X")]);
+    await dispatch({ ...ctx, unknownToolCounter: counter }, [tu("u2", "Y")]);
+    await dispatch({ ...ctx, unknownToolCounter: counter }, [tu("u3", "Z")]);
+    expect(n).toBe(3);
+  });
+
+  it("throws UnknownToolLoopError once the threshold is reached", async () => {
+    const { ctx, sse, auditEvents } = await makeCtx({ tools: [] });
+    let n = 0;
+    const counter = { get: () => n, inc: () => ++n };
+    // 10 unknown tool_use blocks in a single batch → exactly at threshold.
+    const batch = Array.from({ length: UNKNOWN_TOOL_LOOP_THRESHOLD }).map(
+      (_, i) => tu(`u${i}`, "NoSuchTool"),
+    );
+    await expect(
+      dispatch({ ...ctx, unknownToolCounter: counter }, batch),
+    ).rejects.toBeInstanceOf(UnknownToolLoopError);
+    expect(n).toBe(UNKNOWN_TOOL_LOOP_THRESHOLD);
+    const textDeltas = sse.events.filter((e) => e.type === "text_delta");
+    expect(textDeltas.length).toBe(1);
+    const delta = textDeltas[0]?.delta as string | undefined;
+    expect(delta).toContain("할루시네이션");
+    const aborted = auditEvents.find((e) => e.event === "unknown_tool_loop");
+    expect(aborted?.data?.count).toBe(UNKNOWN_TOOL_LOOP_THRESHOLD);
+  });
+
+  it("below threshold does NOT throw", async () => {
+    const { ctx } = await makeCtx({ tools: [] });
+    let n = 0;
+    const counter = { get: () => n, inc: () => ++n };
+    const batch = Array.from({ length: UNKNOWN_TOOL_LOOP_THRESHOLD - 1 }).map(
+      (_, i) => tu(`u${i}`, "NoSuchTool"),
+    );
+    const res = await dispatch({ ...ctx, unknownToolCounter: counter }, batch);
+    expect(res.length).toBe(UNKNOWN_TOOL_LOOP_THRESHOLD - 1);
+    expect(res.every((r) => r.isError)).toBe(true);
+  });
+
+  it("counter accumulates across multiple dispatch calls in one turn", async () => {
+    const { ctx } = await makeCtx({ tools: [] });
+    let n = 0;
+    const counter = { get: () => n, inc: () => ++n };
+    // 4 unknown dispatches per batch × 3 batches = 12 > threshold.
+    const mkBatch = (prefix: string): Array<ReturnType<typeof tu>> =>
+      Array.from({ length: 4 }).map((_, i) => tu(`${prefix}${i}`, "Ghost"));
+    await dispatch({ ...ctx, unknownToolCounter: counter }, mkBatch("a"));
+    await dispatch({ ...ctx, unknownToolCounter: counter }, mkBatch("b"));
+    await expect(
+      dispatch({ ...ctx, unknownToolCounter: counter }, mkBatch("c")),
+    ).rejects.toBeInstanceOf(UnknownToolLoopError);
+    expect(n).toBe(12);
+  });
+});
