@@ -1,0 +1,130 @@
+/**
+ * Config file loader — reads clawy-agent.yaml from the working directory,
+ * resolves ${ENV_VAR} references, and returns a typed config object.
+ */
+
+import fs from "node:fs";
+import path from "node:path";
+import { parse as parseYaml } from "yaml";
+
+export interface ClawyAgentConfig {
+  llm: {
+    provider: "anthropic" | "openai" | "google";
+    model: string;
+    apiKey: string;
+    baseUrl?: string;
+  };
+  channels?: {
+    telegram?: { token: string };
+    discord?: { token: string };
+    webhook?: { url: string; secret?: string };
+  };
+  hooks?: {
+    builtin?: Record<string, boolean>;
+    custom?: Array<{ path: string; event: string; priority: number }>;
+  };
+  memory?: {
+    enabled?: boolean;
+    compaction?: boolean;
+  };
+  workspace?: string;
+  identity?: {
+    name?: string;
+    instructions?: string;
+  };
+}
+
+const CONFIG_FILENAME = "clawy-agent.yaml";
+
+/**
+ * Recursively walk a parsed YAML object and replace every `${VAR_NAME}`
+ * occurrence in string values with `process.env.VAR_NAME`. Unresolved
+ * references (env var not set) are replaced with an empty string.
+ */
+function resolveEnvVars(obj: unknown): unknown {
+  if (typeof obj === "string") {
+    return obj.replace(/\$\{([^}]+)\}/g, (_match, varName: string) => {
+      return process.env[varName.trim()] ?? "";
+    });
+  }
+  if (Array.isArray(obj)) {
+    return obj.map(resolveEnvVars);
+  }
+  if (obj !== null && typeof obj === "object") {
+    const result: Record<string, unknown> = {};
+    for (const [key, value] of Object.entries(obj as Record<string, unknown>)) {
+      result[key] = resolveEnvVars(value);
+    }
+    return result;
+  }
+  return obj;
+}
+
+/**
+ * Load and parse `clawy-agent.yaml` from the given directory (defaults
+ * to `process.cwd()`). Throws with a user-friendly message if the file
+ * is missing or malformed.
+ */
+export function loadConfig(dir?: string): ClawyAgentConfig {
+  const configPath = path.join(dir ?? process.cwd(), CONFIG_FILENAME);
+
+  let raw: string;
+  try {
+    raw = fs.readFileSync(configPath, "utf-8");
+  } catch (err) {
+    const code = (err as NodeJS.ErrnoException).code;
+    if (code === "ENOENT") {
+      throw new Error(
+        `Config file not found: ${configPath}\nRun "clawy-agent init" to create one.`,
+      );
+    }
+    throw new Error(`Failed to read config: ${(err as Error).message}`);
+  }
+
+  let parsed: unknown;
+  try {
+    parsed = parseYaml(raw);
+  } catch (err) {
+    throw new Error(
+      `Invalid YAML in ${configPath}: ${(err as Error).message}`,
+    );
+  }
+
+  if (!parsed || typeof parsed !== "object") {
+    throw new Error(`Config file is empty or not an object: ${configPath}`);
+  }
+
+  const resolved = resolveEnvVars(parsed) as Record<string, unknown>;
+
+  // Minimal validation — ensure the llm block exists.
+  const llm = resolved.llm as Record<string, unknown> | undefined;
+  if (!llm || typeof llm !== "object") {
+    throw new Error(
+      `Missing "llm" section in ${configPath}. Run "clawy-agent init" to generate a valid config.`,
+    );
+  }
+
+  const provider = llm.provider as string;
+  if (!["anthropic", "openai", "google"].includes(provider)) {
+    throw new Error(
+      `Invalid llm.provider "${provider}" — must be anthropic, openai, or google.`,
+    );
+  }
+
+  if (!llm.model || typeof llm.model !== "string") {
+    throw new Error(`Missing llm.model in ${configPath}.`);
+  }
+
+  if (!llm.apiKey || typeof llm.apiKey !== "string") {
+    throw new Error(
+      `Missing llm.apiKey in ${configPath}. Set the environment variable or provide the key directly.`,
+    );
+  }
+
+  return resolved as unknown as ClawyAgentConfig;
+}
+
+/** Return the path where the config file would be written. */
+export function configFilePath(dir?: string): string {
+  return path.join(dir ?? process.cwd(), CONFIG_FILENAME);
+}

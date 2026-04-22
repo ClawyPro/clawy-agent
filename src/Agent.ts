@@ -103,12 +103,34 @@ export interface AgentConfig {
   userId: string;
   /** OpenClaw-compatible path: /home/ocuser/.openclaw/workspace. */
   workspaceRoot: string;
-  gatewayToken: string;
-  apiProxyUrl: string;
-  chatProxyUrl: string;
-  redisUrl: string;
+  /** Clawy Pro gateway token. Optional in OSS mode. */
+  gatewayToken?: string;
+  /** Clawy Pro API proxy URL. Not used in OSS mode. */
+  apiProxyUrl?: string;
+  /** Clawy Pro chat proxy URL. Not used in OSS mode. */
+  chatProxyUrl?: string;
+  /** Clawy Pro Redis URL. Not used in OSS mode. */
+  redisUrl?: string;
   /** Default model for this bot. Overridable per-turn via smart-router. */
   model: string;
+
+  // ── OSS mode fields (populated from YAML config) ──────────────
+  /** LLM provider: anthropic, openai, or google. */
+  llmProvider?: "anthropic" | "openai" | "google";
+  /** LLM API key (from config file, not env). */
+  llmApiKey?: string;
+  /** Custom LLM base URL (e.g. local proxy). */
+  llmBaseUrl?: string;
+  /** Human-readable agent name. Default "Clawy Agent". */
+  agentName?: string;
+  /** Custom system instructions for the agent. */
+  agentInstructions?: string;
+  /** Webhook URL for outbound event delivery. */
+  webhookUrl?: string;
+  /** Webhook HMAC secret for signature verification. */
+  webhookSecret?: string;
+  /** Map of builtin hook names → enabled/disabled. */
+  builtinHooks?: Record<string, boolean>;
   telegramBotToken?: string;
   discordBotToken?: string;
   /**
@@ -237,8 +259,8 @@ export class Agent {
   constructor(config: AgentConfig) {
     this.config = config;
     this.llm = new LLMClient({
-      apiProxyUrl: config.apiProxyUrl,
-      gatewayToken: config.gatewayToken,
+      apiProxyUrl: config.apiProxyUrl ?? "",
+      gatewayToken: config.gatewayToken ?? "",
       defaultModel: config.model,
     });
     this.workspace = new Workspace(config.workspaceRoot);
@@ -294,8 +316,8 @@ export class Agent {
     // §7.14 — out-of-band push notifications via chat-proxy broker.
     this.tools.register(
       makeNotifyUserTool({
-        chatProxyUrl: config.chatProxyUrl,
-        gatewayToken: config.gatewayToken,
+        chatProxyUrl: config.chatProxyUrl ?? "",
+        gatewayToken: config.gatewayToken ?? "",
         userId: config.userId,
       }),
     );
@@ -685,7 +707,7 @@ export class Agent {
       const adapter = factory({
         pushEndpointUrl: url,
         hmacKey: key,
-        gatewayToken: this.config.gatewayToken,
+        gatewayToken: this.config.gatewayToken ?? "",
         botId: this.config.botId,
         userId: this.config.userId,
       });

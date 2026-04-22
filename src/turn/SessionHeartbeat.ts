@@ -40,7 +40,7 @@ export interface HeartbeatFs {
 }
 
 const REAL_FS: HeartbeatFs = {
-  mkdir: (p) => nodefs.mkdir(p, { recursive: true }),
+  mkdir: (p) => nodefs.mkdir(p, { recursive: true }).then(() => {}),
   writeFile: (p, d) => nodefs.writeFile(p, d, "utf8"),
   readFile: (p) => nodefs.readFile(p, "utf8"),
   unlink: (p) => nodefs.unlink(p).catch(() => {}),

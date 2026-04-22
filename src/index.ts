@@ -3,14 +3,32 @@
  *
  * Design: docs/plans/2026-04-19-clawy-core-agent-design.md
  * Status: Phase 0 — boots, serves /health, returns 501 elsewhere.
+ *
+ * Dual-mode:
+ *   - Clawy Pro: BOT_ID env present → startFromEnv() (backward compat)
+ *   - OSS:       CLI passes parsed config → startFromConfig()
  */
 
 import { Agent } from "./Agent.js";
 import { HttpServer } from "./transport/HttpServer.js";
-import { loadRuntimeEnv } from "./config/RuntimeEnv.js";
+import {
+  loadRuntimeEnv,
+  loadFromConfig,
+  type ClawyAgentConfig,
+  type RuntimeEnv,
+} from "./config/RuntimeEnv.js";
 
-async function main(): Promise<void> {
-  const env = loadRuntimeEnv();
+// ── Re-exports for programmatic use ─────────────────────────────
+export { Agent } from "./Agent.js";
+export type { AgentConfig } from "./Agent.js";
+export { Session } from "./Session.js";
+export type { SessionMeta } from "./Session.js";
+export { loadRuntimeEnv, loadFromConfig } from "./config/RuntimeEnv.js";
+export type { RuntimeEnv, ClawyAgentConfig } from "./config/RuntimeEnv.js";
+
+// ── Shared boot logic ───────────────────────────────────────────
+
+async function boot(env: RuntimeEnv): Promise<void> {
   const agent = new Agent(env.agentConfig);
   await agent.start();
 
@@ -41,7 +59,24 @@ async function main(): Promise<void> {
   process.on("SIGINT", shutdown);
 }
 
-main().catch((err) => {
-  console.error("[core-agent] fatal startup error", err);
-  process.exit(1);
-});
+// ── Public start functions ──────────────────────────────────────
+
+/** Start from environment variables (Clawy Pro / K8s pod mode). */
+export async function startFromEnv(): Promise<void> {
+  const env = loadRuntimeEnv();
+  await boot(env);
+}
+
+/** Start from a parsed YAML config object (OSS / CLI mode). */
+export async function startFromConfig(config: ClawyAgentConfig): Promise<void> {
+  const env = loadFromConfig(config);
+  await boot(env);
+}
+
+// ── Auto-start when BOT_ID is set (backward compat) ────────────
+if (process.env.BOT_ID) {
+  startFromEnv().catch((err) => {
+    console.error("[core-agent] fatal startup error", err);
+    process.exit(1);
+  });
+}

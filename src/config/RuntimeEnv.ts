@@ -39,6 +39,70 @@ export interface RuntimeEnv {
   agentConfig: AgentConfig;
 }
 
+// ── OSS config-file types ───────────────────────────────────────
+// Mirrors the shape parsed from clawy-agent.yaml by src/cli/config.ts.
+// Defined here as well so RuntimeEnv has zero import-cycle risk with
+// the CLI module (which may not exist yet during parallel development).
+
+export interface ClawyAgentConfig {
+  llm: {
+    provider: "anthropic" | "openai" | "google";
+    apiKey: string;
+    model?: string;
+    baseUrl?: string;
+  };
+  workspace?: string;
+  identity?: {
+    name?: string;
+    instructions?: string;
+  };
+  channels?: {
+    telegram?: { token: string };
+    discord?: { token: string };
+    webhook?: { url: string; secret?: string };
+  };
+  hooks?: {
+    builtin?: Record<string, boolean>;
+  };
+}
+
+/**
+ * Build a RuntimeEnv from a parsed YAML config (OSS / open-source mode).
+ * Clawy Pro infrastructure fields (gatewayToken, apiProxyUrl, etc.) are
+ * set to safe empty defaults — they are unused when running standalone.
+ */
+export function loadFromConfig(config: ClawyAgentConfig): RuntimeEnv {
+  const agentConfig: AgentConfig = {
+    botId: "local",
+    userId: "local",
+    workspaceRoot: config.workspace ?? "./workspace",
+    model: config.llm.model ?? "claude-sonnet-4-20250514",
+
+    // OSS LLM fields
+    llmProvider: config.llm.provider,
+    llmApiKey: config.llm.apiKey,
+    llmBaseUrl: config.llm.baseUrl,
+
+    // Identity
+    agentName: config.identity?.name ?? "Clawy Agent",
+    agentInstructions: config.identity?.instructions,
+
+    // Channel tokens
+    telegramBotToken: config.channels?.telegram?.token,
+    discordBotToken: config.channels?.discord?.token,
+
+    // Webhook
+    webhookUrl: config.channels?.webhook?.url,
+    webhookSecret: config.channels?.webhook?.secret,
+
+    // Hooks
+    builtinHooks: config.hooks?.builtin,
+  };
+
+  return { port: 8080, agentConfig };
+}
+
+/** Load RuntimeEnv from environment variables (Clawy Pro mode). */
 export function loadRuntimeEnv(): RuntimeEnv {
   const port = parseIntSafe("CORE_AGENT_PORT", 8080);
 
