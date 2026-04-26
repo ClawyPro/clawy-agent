@@ -187,7 +187,7 @@ async function dispatchOne(
     const listText = availableNames.length > 0 ? `${preview}${suffix}` : "(none)";
     const err = `Unknown tool: ${tu.name}. Available tools: ${listText}.`;
     console.warn(
-      `[core-agent] unknown_tool=${tu.name} turnId=${turnId} count=${currentCount}`,
+      `[clawy-agent] unknown_tool=${tu.name} turnId=${turnId} count=${currentCount}`,
     );
     sse.agent({
       type: "tool_end",

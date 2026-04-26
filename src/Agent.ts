@@ -219,7 +219,7 @@ export interface AgentConfig {
   }) => WebAppChannelAdapter;
   /**
    * Directory holding the bundled superpowers skills (one subdirectory
-   * per skill). Defaults to `<repo>/infra/docker/clawy-core-agent/skills/superpowers`
+   * per skill). Defaults to `<repo>/infra/docker/clawy-agent/skills/superpowers`
    * resolved from the module location. Tests inject a temp dir.
    * See `docs/plans/2026-04-20-superpowers-plugin-design.md`.
    */
@@ -507,7 +507,7 @@ export class Agent {
     const session = this.sessions.get(input.sessionKey);
     if (!session) {
       console.warn(
-        `[core-agent] background delivery skipped taskId=${input.taskId}: session not live sessionKey=${input.sessionKey}`,
+        `[clawy-agent] background delivery skipped taskId=${input.taskId}: session not live sessionKey=${input.sessionKey}`,
       );
       return false;
     }
@@ -517,7 +517,7 @@ export class Agent {
       if (channel.type === "app") {
         if (!this.webAppAdapter) {
           console.warn(
-            `[core-agent] background delivery skipped taskId=${input.taskId}: webapp adapter not configured`,
+            `[clawy-agent] background delivery skipped taskId=${input.taskId}: webapp adapter not configured`,
           );
           return false;
         }
@@ -532,7 +532,7 @@ export class Agent {
         const adapter = this.channelAdapters.find((a) => a.kind === channel.type);
         if (!adapter) {
           console.warn(
-            `[core-agent] background delivery skipped taskId=${input.taskId}: ${channel.type} adapter not configured`,
+            `[clawy-agent] background delivery skipped taskId=${input.taskId}: ${channel.type} adapter not configured`,
           );
           return false;
         }
@@ -544,12 +544,12 @@ export class Agent {
       }
 
       console.warn(
-        `[core-agent] background delivery skipped taskId=${input.taskId}: unsupported channel=${channel.type}`,
+        `[clawy-agent] background delivery skipped taskId=${input.taskId}: unsupported channel=${channel.type}`,
       );
       return false;
     } catch (err) {
       console.warn(
-        `[core-agent] background delivery failed taskId=${input.taskId} channel=${channel.type}:${channel.channelId}: ${(err as Error).message}`,
+        `[clawy-agent] background delivery failed taskId=${input.taskId} channel=${channel.type}:${channel.channelId}: ${(err as Error).message}`,
       );
       return false;
     }
@@ -574,7 +574,7 @@ export class Agent {
       await this.backgroundTasks.hydrate();
     } catch (err) {
       console.warn(
-        `[core-agent] background-tasks hydrate failed: ${(err as Error).message}`,
+        `[clawy-agent] background-tasks hydrate failed: ${(err as Error).message}`,
       );
     }
 
@@ -586,12 +586,12 @@ export class Agent {
       if (cfg) {
         this.disciplineDefault = cfg;
         console.log(
-          `[core-agent] discipline: config loaded tdd=${cfg.tdd} git=${cfg.git} enforcement=${cfg.requireCommit}`,
+          `[clawy-agent] discipline: config loaded tdd=${cfg.tdd} git=${cfg.git} enforcement=${cfg.requireCommit}`,
         );
       }
     } catch (err) {
       console.warn(
-        `[core-agent] discipline config load failed: ${(err as Error).message}`,
+        `[clawy-agent] discipline config load failed: ${(err as Error).message}`,
       );
     }
 
@@ -718,7 +718,7 @@ export class Agent {
       },
     });
     console.log(
-      `[core-agent] hooks: builtin registered=${hookResult.registered} skipped=[${hookResult.skipped.join(",")}]`,
+      `[clawy-agent] hooks: builtin registered=${hookResult.registered} skipped=[${hookResult.skipped.join(",")}]`,
     );
 
     // Phase 2a: load workspace skills as first-class Tools (§9.8 P1).
@@ -729,10 +729,10 @@ export class Agent {
       const rpt = this.tools.skillReport();
       const issues = rpt?.issues.length ?? 0;
       console.log(
-        `[core-agent] skills: loaded=${n} issues=${issues} from ${skillsDir}`,
+        `[clawy-agent] skills: loaded=${n} issues=${issues} from ${skillsDir}`,
       );
     } catch (err) {
-      console.warn(`[core-agent] skill load failed: ${(err as Error).message}`);
+      console.warn(`[clawy-agent] skill load failed: ${(err as Error).message}`);
     }
 
     // Cron scheduler — hydrate persisted cron records then wire the
@@ -744,10 +744,10 @@ export class Agent {
       this.crons.setFireHandler((record) => this.fireCron(record));
       this.crons.start();
       console.log(
-        `[core-agent] crons hydrated=${this.crons.list().length} tickerStarted`,
+        `[clawy-agent] crons hydrated=${this.crons.list().length} tickerStarted`,
       );
     } catch (err) {
-      console.warn(`[core-agent] cron hydrate failed: ${(err as Error).message}`);
+      console.warn(`[clawy-agent] cron hydrate failed: ${(err as Error).message}`);
     }
 
     // Native hipocampus memory — qmd index + compaction engine + daily cron.
@@ -771,7 +771,7 @@ export class Agent {
             const result = await this.compactionEngine.run();
             if (result.compacted) await this.qmdManager.reindex();
           } catch (err) {
-            console.warn(`[core-agent] hipocampus cron failed: ${(err as Error).message}`);
+            console.warn(`[clawy-agent] hipocampus cron failed: ${(err as Error).message}`);
           }
         },
       });
@@ -790,10 +790,10 @@ export class Agent {
       );
       this.hooks.register(flushHook);
       console.log(
-        `[core-agent] hipocampus: qmd=${this.qmdManager.isReady()} vector=${(process.env.CORE_AGENT_VECTOR_SEARCH ?? "off").trim().toLowerCase() === "on"} compactor+flush=registered`,
+        `[clawy-agent] hipocampus: qmd=${this.qmdManager.isReady()} vector=${(process.env.CORE_AGENT_VECTOR_SEARCH ?? "off").trim().toLowerCase() === "on"} compactor+flush=registered`,
       );
     } catch (err) {
-      console.warn(`[core-agent] hipocampus init failed: ${(err as Error).message}`);
+      console.warn(`[clawy-agent] hipocampus init failed: ${(err as Error).message}`);
     }
 
     // C1 — channel adapters. Instantiated + started for each configured
@@ -833,17 +833,17 @@ export class Agent {
           await dispatchInbound(this, adapter, msg);
         } catch (err) {
           console.warn(
-            `[core-agent] ${adapter.kind} dispatch failed: ${(err as Error).message}`,
+            `[clawy-agent] ${adapter.kind} dispatch failed: ${(err as Error).message}`,
           );
         }
       });
       try {
         await adapter.start();
         this.channelAdapters.push(adapter);
-        console.log(`[core-agent] channel adapter started kind=${adapter.kind}`);
+        console.log(`[clawy-agent] channel adapter started kind=${adapter.kind}`);
       } catch (err) {
         console.warn(
-          `[core-agent] channel adapter start failed kind=${adapter.kind}: ${(err as Error).message}`,
+          `[clawy-agent] channel adapter start failed kind=${adapter.kind}: ${(err as Error).message}`,
         );
       }
     }
@@ -877,10 +877,10 @@ export class Agent {
       // lifecycle symmetry with Telegram/Discord.
       void adapter.start();
       this.webAppAdapter = adapter;
-      console.log(`[core-agent] webapp push adapter started`);
+      console.log(`[clawy-agent] webapp push adapter started`);
     } catch (err) {
       console.warn(
-        `[core-agent] webapp push adapter start failed: ${(err as Error).message}`,
+        `[clawy-agent] webapp push adapter start failed: ${(err as Error).message}`,
       );
     }
   }
@@ -901,7 +901,7 @@ export class Agent {
         await this.closeSession(key, "shutdown");
       } catch (err) {
         console.warn(
-          `[core-agent] session close on shutdown failed sessionKey=${key}: ${(err as Error).message}`,
+          `[clawy-agent] session close on shutdown failed sessionKey=${key}: ${(err as Error).message}`,
         );
       }
     }
@@ -914,7 +914,7 @@ export class Agent {
         await adapter.stop();
       } catch (err) {
         console.warn(
-          `[core-agent] channel adapter stop failed kind=${adapter.kind}: ${(err as Error).message}`,
+          `[clawy-agent] channel adapter stop failed kind=${adapter.kind}: ${(err as Error).message}`,
         );
       }
     }
@@ -925,7 +925,7 @@ export class Agent {
         await this.webAppAdapter.stop();
       } catch (err) {
         console.warn(
-          `[core-agent] webapp adapter stop failed: ${(err as Error).message}`,
+          `[clawy-agent] webapp adapter stop failed: ${(err as Error).message}`,
         );
       }
       this.webAppAdapter = null;
@@ -981,7 +981,7 @@ export class Agent {
           await this.closeSession(sessionKey, "cron_complete");
         } catch (err) {
           console.warn(
-            `[core-agent] fireCron: closeSession failed cronId=${record.cronId}: ${(err as Error).message}`,
+            `[clawy-agent] fireCron: closeSession failed cronId=${record.cronId}: ${(err as Error).message}`,
           );
         }
       }
@@ -1055,7 +1055,7 @@ export class Agent {
       if (init.code !== 0) {
         this.disciplineDefault = { ...this.disciplineDefault, git: false };
         console.warn(
-          `[core-agent] discipline: git init failed (code=${init.code}) — disabling git half. ${init.stderr.slice(0, 200)}`,
+          `[clawy-agent] discipline: git init failed (code=${init.code}) — disabling git half. ${init.stderr.slice(0, 200)}`,
         );
         return;
       }
@@ -1070,12 +1070,12 @@ export class Agent {
         "clawy-bot",
       ]);
       console.log(
-        `[core-agent] discipline: git repo initialised at ${this.config.workspaceRoot}`,
+        `[clawy-agent] discipline: git repo initialised at ${this.config.workspaceRoot}`,
       );
     } catch (err) {
       this.disciplineDefault = { ...this.disciplineDefault, git: false };
       console.warn(
-        `[core-agent] discipline: git init threw — disabling git half: ${(err as Error).message}`,
+        `[clawy-agent] discipline: git init threw — disabling git half: ${(err as Error).message}`,
       );
     }
   }
@@ -1161,7 +1161,7 @@ export class Agent {
         listener(event);
       } catch (err) {
         console.warn(
-          `[core-agent] agent-event listener failed type=${event.type}: ${(err as Error).message}`,
+          `[clawy-agent] agent-event listener failed type=${event.type}: ${(err as Error).message}`,
         );
       }
     }
@@ -1200,7 +1200,7 @@ export class Agent {
  * order:
  *   1. `$CORE_AGENT_SUPERPOWERS_DIR` env override.
  *   2. `<cwd>/skills/superpowers` — matches the Docker WORKDIR (/app)
- *      and the repo layout (`infra/docker/clawy-core-agent/`).
+ *      and the repo layout (`infra/docker/clawy-agent/`).
  *
  * The directory may not exist in unit tests that never touch
  * superpowers — the slash handlers fail open with a short pointer

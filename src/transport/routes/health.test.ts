@@ -110,7 +110,7 @@ describe("HttpServer /health + /healthz", () => {
     };
     expect(body.ok).toBe(true);
     expect(body.botId).toBe("bot-test");
-    expect(body.runtime).toBe("core-agent");
+    expect(body.runtime).toBe("clawy-agent");
     expect(body.version).toBe("0.1.0");
   });
 

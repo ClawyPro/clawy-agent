@@ -641,7 +641,7 @@ export class Session {
         this.abortController.abort();
       } catch (err) {
         console.warn(
-          `[core-agent] session close: abort failed sessionKey=${this.meta.sessionKey}: ${(err as Error).message}`,
+          `[clawy-agent] session close: abort failed sessionKey=${this.meta.sessionKey}: ${(err as Error).message}`,
         );
       }
     }
@@ -674,7 +674,7 @@ export class Session {
           await this.agent.crons.delete(cronId);
         } catch (err) {
           console.warn(
-            `[core-agent] session close: cron delete failed cronId=${cronId}: ${(err as Error).message}`,
+            `[clawy-agent] session close: cron delete failed cronId=${cronId}: ${(err as Error).message}`,
           );
         }
       }
@@ -885,7 +885,7 @@ export class Session {
               // Hooks see the incremented retryCount and will fail-open.
               turn.incrementCommitRetry();
               console.log(
-                `[core-agent] commit retry ${attempt + 1}/${MAX_COMMIT_ATTEMPTS}` +
+                `[clawy-agent] commit retry ${attempt + 1}/${MAX_COMMIT_ATTEMPTS}` +
                 ` turnId=${turn.meta.turnId} reason=${msg.slice(0, 200)}`,
               );
             }

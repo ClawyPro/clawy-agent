@@ -13,7 +13,7 @@ export const healthRoutes: RouteHandler[] = [
     writeJson(res, 200, {
       ok: true,
       botId: ctx.agent.config.botId,
-      runtime: "core-agent",
+      runtime: "clawy-agent",
       version: "0.1.0",
     });
   }),
@@ -23,7 +23,7 @@ export const healthRoutes: RouteHandler[] = [
     writeJson(res, 200, {
       ok: true,
       botId: ctx.agent.config.botId,
-      runtime: "core-agent",
+      runtime: "clawy-agent",
       version: "0.1.0",
       tools: tools.map((t) => ({ name: t.name, permission: t.permission })),
       skills: skillReport

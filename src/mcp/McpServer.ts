@@ -150,7 +150,7 @@ export class McpServer {
         tools: { listChanged: false },
       },
       serverInfo: {
-        name: "clawy-core-agent",
+        name: "clawy-agent",
         version: "0.1.0",
       },
       ...(opts.clientId ? { clientId: opts.clientId } : {}),

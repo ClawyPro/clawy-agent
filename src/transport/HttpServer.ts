@@ -6,7 +6,7 @@
  * `http.createServer`. Per-domain request handlers live under
  * `transport/routes/` and are declared as `RouteHandler` entries in
  * the flat dispatch table below (R5,
- * docs/plans/2026-04-19-core-agent-refactor-plan.md).
+ * .
  *
  * Routes are walked top-to-bottom on every request; the first handler
  * whose `match()` returns a non-null value wins. Anything that falls

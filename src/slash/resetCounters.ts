@@ -69,7 +69,7 @@ export class ResetCounterStore {
       // Logged, not thrown — slash commands must never wedge on a
       // corrupt sidecar file.
       console.warn(
-        `[core-agent] reset-counters load failed: ${(err as Error).message}`,
+        `[clawy-agent] reset-counters load failed: ${(err as Error).message}`,
       );
     }
   }

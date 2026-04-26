@@ -270,7 +270,7 @@ function makePromptSkillTool(opts: {
   const { text, truncated } = truncatePromptBody(body);
   if (truncated) {
     console.warn(
-      `[core-agent] skill "${skillName}" body truncated to ${PROMPT_BODY_MAX_BYTES} bytes for prompt-only delivery`,
+      `[clawy-agent] skill "${skillName}" body truncated to ${PROMPT_BODY_MAX_BYTES} bytes for prompt-only delivery`,
     );
   }
 

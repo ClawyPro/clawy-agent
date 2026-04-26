@@ -197,7 +197,7 @@ export class Turn {
 
         const payloadSize = JSON.stringify(messages).length + JSON.stringify(systemPrompt).length;
         console.log(
-          `[core-agent] llm-call iter=${iter} payloadSize=${payloadSize}` +
+          `[clawy-agent] llm-call iter=${iter} payloadSize=${payloadSize}` +
           ` msgCount=${messages.length} model=${this.session.agent.config.model}` +
           ` turnId=${this.meta.turnId}`,
         );
@@ -223,7 +223,7 @@ export class Turn {
         const stateRef = { recoveryAttempt: this.recoveryAttempt, assistantTextSoFarLen: this.assistantTextSoFarLen() };
         const decision = handleStopReason(
           { stageAuditEvent: (e, d) => this.stageAuditEvent(e, d),
-            logUnknown: (raw, t) => console.warn(`[core-agent] unknown stop_reason=${String(raw)} turnId=${t}`) },
+            logUnknown: (raw, t) => console.warn(`[clawy-agent] unknown stop_reason=${String(raw)} turnId=${t}`) },
           stateRef,
           { stopReasonRaw: stopReason, blocks, iter, turnId: this.meta.turnId, messages },
         );
@@ -234,7 +234,7 @@ export class Turn {
           .filter((b) => b.type === "text")
           .reduce((sum, b) => sum + ((b as { text: string }).text?.length ?? 0), 0);
         console.log(
-          `[core-agent] iter=${iter} stop=${String(stopReason)} decision=${decision.kind}` +
+          `[clawy-agent] iter=${iter} stop=${String(stopReason)} decision=${decision.kind}` +
           ` blocks=${blocks.length} textLen=${textLen}` +
           ` in=${usage.inputTokens} out=${usage.outputTokens}` +
           ` recovery=${this.recoveryAttempt} emptyRetry=${this.emptyResponseRetry}` +
@@ -249,7 +249,7 @@ export class Turn {
           // the queued messages.
           if (this.session.hasPendingInjections()) {
             console.log(
-              `[core-agent] finalise deferred — pending injections exist` +
+              `[clawy-agent] finalise deferred — pending injections exist` +
               ` turnId=${this.meta.turnId} iter=${iter}`,
             );
             messages.push({ role: "assistant", content: blocks });
@@ -295,7 +295,7 @@ export class Turn {
               // Add to emittedAssistantBlocks so commit picks it up
               this.emittedAssistantBlocks.push({ type: "text", text: fallback } as LLMContentBlock);
               console.log(
-                `[core-agent] thinking-to-text fallback in execute:` +
+                `[clawy-agent] thinking-to-text fallback in execute:` +
                 ` thinkingLen=${thinkingContent.length} fallbackLen=${fallback.length}` +
                 ` turnId=${this.meta.turnId}`,
               );
@@ -318,7 +318,7 @@ export class Turn {
             // or already ends with terminal punctuation.
             if (lastText.length > 200 && !TERMINAL_RE.test(lastChar)) {
               console.log(
-                `[core-agent] truncation-guard fired: lastChar=${JSON.stringify(lastChar)}` +
+                `[clawy-agent] truncation-guard fired: lastChar=${JSON.stringify(lastChar)}` +
                 ` textLen=${lastText.length} retry=${this.truncationRecovery}`,
               );
               messages.push({ role: "assistant", content: blocks });

@@ -93,7 +93,7 @@ export async function commit(ctx: CommitPipelineContext): Promise<CommitResult> 
       }
       finalText = fallback.trim();
       console.log(
-        `[core-agent] thinking-to-text fallback: thinkingLen=${thinkingContent.length}` +
+        `[clawy-agent] thinking-to-text fallback: thinkingLen=${thinkingContent.length}` +
         ` extractedLen=${finalText.length} turnId=${ctx.turnId}`,
       );
       // Emit the fallback text to the SSE stream so the client sees it

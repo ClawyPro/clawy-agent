@@ -1,7 +1,6 @@
 /**
- * clawy-core-agent entrypoint.
+ * clawy-agent entrypoint.
  *
- * Design: docs/plans/2026-04-19-clawy-core-agent-design.md
  * Status: Phase 0 — boots, serves /health, returns 501 elsewhere.
  *
  * Dual-mode:
@@ -40,17 +39,17 @@ async function boot(env: RuntimeEnv): Promise<void> {
   await http.start();
 
   console.log(
-    `[core-agent] botId=${env.agentConfig.botId} port=${env.port} phase=0 ready`,
+    `[clawy-agent] botId=${env.agentConfig.botId} port=${env.port} phase=0 ready`,
   );
 
   const shutdown = async (signal: NodeJS.Signals): Promise<void> => {
-    console.log(`[core-agent] ${signal} received, shutting down`);
+    console.log(`[clawy-agent] ${signal} received, shutting down`);
     try {
       await http.stop();
       await agent.stop();
       process.exit(0);
     } catch (err) {
-      console.error("[core-agent] shutdown error", err);
+      console.error("[clawy-agent] shutdown error", err);
       process.exit(1);
     }
   };
@@ -76,7 +75,7 @@ export async function startFromConfig(config: ClawyAgentConfig): Promise<void> {
 // ── Auto-start when BOT_ID is set (backward compat) ────────────
 if (process.env.BOT_ID) {
   startFromEnv().catch((err) => {
-    console.error("[core-agent] fatal startup error", err);
+    console.error("[clawy-agent] fatal startup error", err);
     process.exit(1);
   });
 }

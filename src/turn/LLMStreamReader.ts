@@ -113,7 +113,7 @@ export async function readOne(
         const repResult = repetitionDetector.feed(evt.delta);
         if (repResult.detected) {
           console.warn(
-            `[core-agent] REPETITION DETECTED — aborting stream.` +
+            `[clawy-agent] REPETITION DETECTED — aborting stream.` +
             ` pattern="${repResult.pattern}" count=${repResult.count}`,
           );
           deps.sse.agent({

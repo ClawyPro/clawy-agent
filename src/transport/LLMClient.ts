@@ -85,7 +85,7 @@ function sanitizeToolUseId(raw: string): string {
  * `[a-zA-Z0-9_-]`. Some upstream providers and synthetic paths can emit
  * looser ids (for example `call.one` or `toolu:...`). Normalize every
  * tool_use / tool_result id pair just before the request leaves the
- * core-agent boundary so historical transcript quirks cannot 400 a new turn.
+ * clawy-agent boundary so historical transcript quirks cannot 400 a new turn.
  */
 export function normalizeToolUseIdsForRequest(messages: LLMMessage[]): LLMMessage[] {
   const idMap = new Map<string, string>();
