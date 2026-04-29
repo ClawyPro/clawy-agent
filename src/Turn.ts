@@ -13,7 +13,11 @@ import type { LLMContentBlock, LLMMessage, LLMToolDef, LLMUsage } from "./transp
 import type { AskUserQuestionOutput } from "./Tool.js";
 import type { HookPoint } from "./hooks/types.js";
 import { computeUsd } from "./llm/modelCapabilities.js";
-import { buildSystemPrompt, buildMessages } from "./turn/MessageBuilder.js";
+import {
+  appendRuntimeModelIdentityContext,
+  buildSystemPrompt,
+  buildMessages,
+} from "./turn/MessageBuilder.js";
 import { readOne as readOneStream } from "./turn/LLMStreamReader.js";
 import { dispatch as dispatchTools, type ToolDispatchResult, UnknownToolLoopError } from "./turn/ToolDispatcher.js";
 import { handle as handleStopReason } from "./turn/StopReasonHandler.js";
@@ -30,6 +34,8 @@ import { HeartbeatMonitor, wrapSseWithMonitor } from "./turn/HeartbeatMonitor.js
 import { SessionHeartbeat } from "./turn/SessionHeartbeat.js";
 import { RetryController } from "./turn/RetryController.js";
 import type { TurnRoute, TurnStatus, TurnMeta, TurnStopReason, PlanResult, VerificationReport } from "./turn/types.js";
+import { messagesHaveImages } from "./routing/messageText.js";
+import { isRouterKeyword } from "./routing/types.js";
 
 // Re-exports for callers + tests.
 export type { TurnRoute, TurnStatus, TurnMeta, TurnStopReason, PlanResult, VerificationReport, TurnResult } from "./turn/types.js";
@@ -53,6 +59,23 @@ export class TurnInterruptedError extends Error {
     this.handoffRequested = handoffRequested;
     this.source = source;
   }
+}
+
+function normalizeAssistantReplayBlocks(blocks: LLMContentBlock[]): LLMContentBlock[] {
+  const toolUseBlocks = blocks.filter((block) => block.type === "tool_use");
+  if (toolUseBlocks.length === 0) return blocks;
+  const prefixBlocks = blocks.filter((block) => block.type !== "tool_use");
+  return [...prefixBlocks, ...toolUseBlocks];
+}
+
+function finalAssistantReplayBlocks(blocks: LLMContentBlock[]): LLMContentBlock[] {
+  return normalizeAssistantReplayBlocks(blocks).filter((block) => block.type !== "tool_use");
+}
+
+function configuredModelForSession(session: Session): string {
+  const model = (session as unknown as { agent?: { config?: { model?: unknown } } })
+    .agent?.config?.model;
+  return typeof model === "string" && model.length > 0 ? model : "unknown";
 }
 
 export class Turn {
@@ -144,6 +167,7 @@ export class Turn {
     declaredRoute: TurnRoute = "direct",
     options: { planMode?: boolean } = {},
   ) {
+    const configuredModel = configuredModelForSession(session);
     this.meta = {
       turnId,
       sessionKey: session.meta.sessionKey,
@@ -151,6 +175,8 @@ export class Turn {
       declaredRoute,
       status: "pending",
       usage: { inputTokens: 0, outputTokens: 0, costUsd: 0 },
+      configuredModel,
+      effectiveModel: configuredModel,
     };
     this.asks = new AskUserController(turnId, sse);
     // T2-08 — Session permission mode is authoritative.
@@ -268,25 +294,31 @@ export class Turn {
         ({ messages, tools: toolDefs, system: systemPrompt } = preLLM.args);
         this.throwIfInterrupted();
 
+        const effectiveModel = await this.resolveEffectiveModel(messages, toolDefs);
+        appendRuntimeModelIdentityContext(messages, {
+          configuredModel: this.session.agent.config.model,
+          effectiveModel,
+          ...(this.meta.routeDecision ? { routeDecision: this.meta.routeDecision } : {}),
+        });
         const payloadSize = JSON.stringify(messages).length + JSON.stringify(systemPrompt).length;
         console.log(
           `[core-agent] llm-call iter=${iter} payloadSize=${payloadSize}` +
-          ` msgCount=${messages.length} model=${runtimeModel}` +
+          ` msgCount=${messages.length} model=${effectiveModel}` +
           ` turnId=${this.meta.turnId}`,
         );
 
         const { blocks, stopReason, usage } = await readOneStream(
-          { llm: this.session.agent.llm, model: runtimeModel, sse,
+          { llm: this.session.agent.llm, model: effectiveModel, sse,
             abortSignal: this.interruptController.signal,
             onError: (code, err) => this.emitError(code, err) },
           systemPrompt, messages, toolDefs,
-          this.forceNoThinking ? { thinkingOverride: { type: "disabled" } } : undefined,
+          this.readOptions(),
         );
         // Reset after use — only applies to the single recovery call.
         this.forceNoThinking = false;
         this.recordUsage(usage);
         this.emittedAssistantBlocks.push(...blocks);
-        this.canonicalAssistantMessages.push(blocks);
+        this.canonicalAssistantMessages.push(normalizeAssistantReplayBlocks(blocks));
         this.throwIfInterrupted();
 
         void this.session.agent.hooks.runPost(
@@ -327,13 +359,16 @@ export class Turn {
           // beforeLLMCall → midTurnInjector drains them. The bot
           // finishes its current response naturally, then addresses
           // the queued messages.
+          const finalBlocks = finalAssistantReplayBlocks(blocks);
           if (this.session.hasPendingInjections()) {
             console.log(
               `[core-agent] finalise deferred — pending injections exist` +
               ` turnId=${this.meta.turnId} iter=${iter}`,
             );
             this.clearUserVisibleDraftForDeferredFinalise(sse, "pending_injection");
-            messages.push({ role: "assistant", content: blocks });
+            if (finalBlocks.length > 0) {
+              messages.push({ role: "assistant", content: finalBlocks });
+            }
             continue;
           }
 
@@ -341,7 +376,9 @@ export class Turn {
           // Covers: thinking-only, tool_use-only, subagent delegation.
           const hasText = this.emittedAssistantBlocks.some((b) => b.type === "text");
           if (!hasText && this.emptyResponseRetry < Turn.MAX_EMPTY_RESPONSE_RETRIES) {
-            messages.push({ role: "assistant", content: blocks });
+            if (finalBlocks.length > 0) {
+              messages.push({ role: "assistant", content: finalBlocks });
+            }
             const nudge = this.emptyResponseRetry === 0
               ? "You completed your work but didn't produce a visible text response — the user sees an empty message. Please summarize what you did and your findings as text. Do NOT use thinking — write your summary directly as text."
               : "Your response was still empty. The user CANNOT see your thinking — only text output is visible. Write a brief summary of what you did as plain text immediately.";
@@ -371,7 +408,9 @@ export class Turn {
                 `[core-agent] truncation-guard fired: lastChar=${JSON.stringify(lastChar)}` +
                 ` textLen=${lastText.length} retry=${this.truncationRecovery}`,
               );
-              messages.push({ role: "assistant", content: blocks });
+              if (finalBlocks.length > 0) {
+                messages.push({ role: "assistant", content: finalBlocks });
+              }
               messages.push({ role: "user", content: "Your response was cut off mid-sentence. Continue from where you left off." });
               this.truncationRecovery += 1;
               iter -= 1;
@@ -380,7 +419,9 @@ export class Turn {
           }
           this.retryBaseMessages = [
             ...messages,
-            { role: "assistant", content: blocks },
+            ...(finalBlocks.length > 0
+              ? [{ role: "assistant" as const, content: finalBlocks }]
+              : []),
           ];
           return;
         }
@@ -508,7 +549,7 @@ export class Turn {
     blocks: LLMContentBlock[],
     results: ToolDispatchResult[],
   ): void {
-    messages.push({ role: "assistant", content: blocks });
+    messages.push({ role: "assistant", content: normalizeAssistantReplayBlocks(blocks) });
     messages.push({
       role: "user",
       content: results.map((r) => ({
@@ -575,7 +616,7 @@ export class Turn {
     let messages = this.retryBaseMessages.length > 0
       ? [...this.retryBaseMessages]
       : await buildMessages(this.session, this.userMessage, runtimeModel);
-    if (this.retryBaseMessages.length === 0) {
+    if (this.retryBaseMessages.length === 0 && failedBlocks.length > 0) {
       messages.push({ role: "assistant", content: failedBlocks });
     }
     messages.push({ role: "user", content: hiddenUserMessage });
@@ -601,10 +642,11 @@ export class Turn {
       if (preLLM.action === "skip") return;
       ({ messages, tools: toolDefs, system: systemPrompt } = preLLM.args);
 
+      const effectiveModel = await this.resolveEffectiveModel(messages, toolDefs);
       const { blocks, stopReason, usage } = await readOneStream(
         {
           llm: this.session.agent.llm,
-          model: runtimeModel,
+          model: effectiveModel,
           sse: this.sse,
           abortSignal: this.interruptController.signal,
           onError: (code, err) => this.emitError(code, err),
@@ -612,12 +654,12 @@ export class Turn {
         systemPrompt,
         messages,
         toolDefs as LLMToolDef[],
-        this.forceNoThinking ? { thinkingOverride: { type: "disabled" } } : undefined,
+        this.readOptions(),
       );
       this.forceNoThinking = false;
       this.recordUsage(usage);
       this.emittedAssistantBlocks.push(...blocks);
-      this.canonicalAssistantMessages.push(blocks);
+      this.canonicalAssistantMessages.push(normalizeAssistantReplayBlocks(blocks));
       void this.session.agent.hooks.runPost(
         "afterLLMCall",
         { messages, tools: toolDefs, system: systemPrompt, iteration: iter, stopReason, assistantBlocks: blocks },
@@ -640,9 +682,12 @@ export class Turn {
       this.recoveryAttempt = stateRef.recoveryAttempt;
 
       if (decision.kind === "finalise") {
+        const finalBlocks = finalAssistantReplayBlocks(blocks);
         this.retryBaseMessages = [
           ...messages,
-          { role: "assistant", content: blocks },
+          ...(finalBlocks.length > 0
+            ? [{ role: "assistant" as const, content: finalBlocks }]
+            : []),
         ];
         return;
       }
@@ -709,7 +754,56 @@ export class Turn {
   }
 
   private currentModel(): string {
-    return this.runtimeModel ?? this.session.agent.config.model;
+    return this.meta.effectiveModel ?? this.runtimeModel ?? this.session.agent.config.model;
+  }
+
+  private async resolveEffectiveModel(
+    messages: LLMMessage[],
+    toolDefs: ReadonlyArray<{ name: string }>,
+  ): Promise<string> {
+    // Use dynamically resolved model (from api-proxy /v1/bot-model) if available,
+    // falling back to pod env config.model. This ensures chat picker model changes
+    // take effect without pod restart.
+    const dynamicModel = await this.resolveRuntimeModel();
+    const configuredModel = dynamicModel || this.session.agent.config.model;
+    this.meta.configuredModel = configuredModel;
+    if (!isRouterKeyword(configuredModel) || !this.session.agent.router) {
+      this.meta.effectiveModel = configuredModel;
+      this.meta.routeDecision = undefined;
+      return configuredModel;
+    }
+    if (this.meta.routeDecision) {
+      this.meta.effectiveModel = this.meta.routeDecision.model;
+      return this.meta.routeDecision.model;
+    }
+
+    const decision = await this.session.agent.router.resolve({
+      configuredModel,
+      messages,
+      hasTools: toolDefs.length > 0,
+      hasImages: messagesHaveImages(messages),
+    });
+    this.meta.routeDecision = decision;
+    this.meta.effectiveModel = decision.model;
+    return decision.model;
+  }
+
+  private readOptions() {
+    return {
+      ...(this.forceNoThinking
+        ? { thinkingOverride: { type: "disabled" as const } }
+        : {}),
+      ...(this.meta.routeDecision
+        ? {
+            routing: {
+              profileId: this.meta.routeDecision.profileId,
+              tier: this.meta.routeDecision.tier,
+              provider: this.meta.routeDecision.provider,
+              confidence: this.meta.routeDecision.confidence,
+            },
+          }
+        : {}),
+    };
   }
 
   private buildCommitCtx(): CommitPipelineContext {

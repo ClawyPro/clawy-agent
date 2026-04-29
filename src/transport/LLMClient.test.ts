@@ -135,6 +135,42 @@ describe("normalizeToolUseIdsForRequest", () => {
       ],
     });
   });
+
+  it("allocates fresh canonical ids for repeated raw tool_use ids across turns", () => {
+    const messages: LLMMessage[] = [
+      {
+        role: "assistant",
+        content: [{ type: "tool_use", id: "functions.TaskOutput:0", name: "TaskOutput", input: {} }],
+      },
+      {
+        role: "user",
+        content: [{ type: "tool_result", tool_use_id: "functions.TaskOutput:0", content: "first" }],
+      },
+      {
+        role: "assistant",
+        content: [{ type: "tool_use", id: "functions.TaskOutput:0", name: "TaskOutput", input: {} }],
+      },
+      {
+        role: "user",
+        content: [{ type: "tool_result", tool_use_id: "functions.TaskOutput:0", content: "second" }],
+      },
+    ];
+
+    const normalized = normalizeToolUseIdsForRequest(messages);
+
+    expect(normalized[0]).toMatchObject({
+      content: [{ type: "tool_use", id: "functions_TaskOutput_0" }],
+    });
+    expect(normalized[1]).toMatchObject({
+      content: [{ type: "tool_result", tool_use_id: "functions_TaskOutput_0" }],
+    });
+    expect(normalized[2]).toMatchObject({
+      content: [{ type: "tool_use", id: "functions_TaskOutput_0_1" }],
+    });
+    expect(normalized[3]).toMatchObject({
+      content: [{ type: "tool_result", tool_use_id: "functions_TaskOutput_0_1" }],
+    });
+  });
 });
 
 describe("LLMClient.stream abort", () => {

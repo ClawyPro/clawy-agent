@@ -14,6 +14,7 @@ import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import {
+  appendRuntimeModelIdentityContext,
   buildSystemPrompt,
   buildMessages,
   formatReplyPreamble,
@@ -390,6 +391,110 @@ describe("MessageBuilder.buildMessages", () => {
           },
         },
       ],
+    });
+  });
+});
+
+describe("MessageBuilder.appendRuntimeModelIdentityContext", () => {
+  it("inserts hidden runtime model identity before the current user message", () => {
+    const messages: LLMMessage[] = [
+      { role: "assistant", content: "prior" },
+      { role: "user", content: "what model are you?" },
+    ];
+
+    appendRuntimeModelIdentityContext(messages, {
+      configuredModel: "clawy-smart-router/auto",
+      effectiveModel: "openai/gpt-5.5",
+      routeDecision: {
+        profileId: "premium",
+        tier: "premium",
+        provider: "openai",
+        model: "gpt-5.5",
+        classifierModel: "claude-sonnet-4-6",
+        classifierUsed: true,
+        confidence: "high",
+        reason: "complex task",
+      },
+    });
+
+    expect(messages).toHaveLength(3);
+    expect(messages[1]).toMatchObject({
+      role: "user",
+      content: [
+        {
+          type: "text",
+          text: expect.stringContaining("<runtime_model_identity hidden=\"true\">"),
+        },
+      ],
+    });
+    expect(messages[2]?.content).toBe("what model are you?");
+  });
+
+  it("replaces stale runtime model identity instead of accumulating copies", () => {
+    const messages: LLMMessage[] = [
+      {
+        role: "user",
+        content: [
+          {
+            type: "text",
+            text: "<runtime_model_identity hidden=\"true\">\nstale\n</runtime_model_identity>",
+          },
+        ],
+      },
+      { role: "user", content: "current" },
+    ];
+
+    appendRuntimeModelIdentityContext(messages, {
+      configuredModel: "claude-sonnet-4-6",
+      effectiveModel: "claude-sonnet-4-6",
+    });
+
+    const serialized = JSON.stringify(messages);
+    expect(serialized.match(/runtime_model_identity/g)?.length).toBe(2);
+    expect(serialized).not.toContain("stale");
+  });
+
+  it("does not insert runtime model identity between tool_use and tool_result", () => {
+    const messages: LLMMessage[] = [
+      {
+        role: "assistant",
+        content: [
+          {
+            type: "tool_use",
+            id: "toolu_01JwgQJ74c97cZKarec8fA4z",
+            name: "Bash",
+            input: { command: "echo hi" },
+          },
+        ],
+      },
+      {
+        role: "user",
+        content: [
+          {
+            type: "tool_result",
+            tool_use_id: "toolu_01JwgQJ74c97cZKarec8fA4z",
+            content: "hi",
+          },
+        ],
+      },
+    ];
+
+    appendRuntimeModelIdentityContext(messages, {
+      configuredModel: "clawy-smart-router/auto",
+      effectiveModel: "openai/gpt-5.5",
+    });
+
+    expect(messages).toHaveLength(2);
+    const nextContent = messages[1]?.content;
+    expect(Array.isArray(nextContent)).toBe(true);
+    if (!Array.isArray(nextContent)) return;
+    expect(nextContent[0]).toMatchObject({
+      type: "tool_result",
+      tool_use_id: "toolu_01JwgQJ74c97cZKarec8fA4z",
+    });
+    expect(nextContent[1]).toMatchObject({
+      type: "text",
+      text: expect.stringContaining("<runtime_model_identity hidden=\"true\">"),
     });
   });
 });

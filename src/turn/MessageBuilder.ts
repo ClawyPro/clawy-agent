@@ -13,7 +13,7 @@
 
 import type { Session } from "../Session.js";
 import type { ReplyToRef, UserMessage } from "../util/types.js";
-import type { LLMMessage } from "../transport/LLMClient.js";
+import type { LLMContentBlock, LLMMessage } from "../transport/LLMClient.js";
 import { renderIdentitySystem } from "../storage/Workspace.js";
 import { getCapability } from "../llm/modelCapabilities.js";
 
@@ -32,6 +32,24 @@ export const TOKEN_LIMIT_FOR_COMPACTION = 150_000;
  * message the user is answering.
  */
 export const REPLY_PREVIEW_MAX_CHARS = 200;
+
+export interface RuntimeModelIdentityContext {
+  configuredModel: string;
+  effectiveModel: string;
+  routeDecision?: {
+    profileId?: string;
+    tier: string;
+    provider: string;
+    model?: string;
+    classifierModel?: string;
+    classifierUsed?: boolean;
+    confidence?: string | number;
+    reason?: string;
+  };
+}
+
+const RUNTIME_MODEL_IDENTITY_OPEN = "<runtime_model_identity hidden=\"true\">";
+const RUNTIME_MODEL_IDENTITY_CLOSE = "</runtime_model_identity>";
 
 /**
  * Format a `ReplyToRef` into a single-line preamble. The line sits
@@ -53,6 +71,112 @@ export function formatReplyPreamble(replyTo: ReplyToRef): string {
       ? `${collapsed.slice(0, REPLY_PREVIEW_MAX_CHARS)}…`
       : collapsed;
   return `[Reply to ${replyTo.role}: "${truncated}"]`;
+}
+
+function runtimeModelLabel(model: string, provider?: string): string {
+  if (model.includes("/") || !provider) return model;
+  return `${provider}/${model}`;
+}
+
+function routerDisplayName(profileId: string | undefined): string {
+  if (profileId === "standard") return "Standard Router";
+  if (profileId === "premium") return "Premium Router";
+  if (profileId === "anthropic_only") return "Claude Router";
+  return profileId ? `${profileId} Router` : "Direct model";
+}
+
+function isRuntimeModelIdentityBlock(block: LLMContentBlock): boolean {
+  return block.type === "text" && block.text.includes(RUNTIME_MODEL_IDENTITY_OPEN);
+}
+
+function isRuntimeModelIdentityMessage(message: LLMMessage): boolean {
+  const content = message.content;
+  if (typeof content === "string") {
+    return content.includes(RUNTIME_MODEL_IDENTITY_OPEN);
+  }
+  return content.some(isRuntimeModelIdentityBlock);
+}
+
+function removeRuntimeModelIdentityContext(messages: LLMMessage[]): void {
+  for (let i = messages.length - 1; i >= 0; i -= 1) {
+    const message = messages[i]!;
+    if (!isRuntimeModelIdentityMessage(message)) continue;
+    if (typeof message.content === "string") {
+      messages.splice(i, 1);
+      continue;
+    }
+    message.content = message.content.filter(
+      (block) => !isRuntimeModelIdentityBlock(block),
+    );
+    if (message.content.length === 0) {
+      messages.splice(i, 1);
+    }
+  }
+}
+
+function beginsWithToolResult(message: LLMMessage | undefined): boolean {
+  return Boolean(
+    message &&
+      message.role === "user" &&
+      Array.isArray(message.content) &&
+      message.content[0]?.type === "tool_result",
+  );
+}
+
+function buildRuntimeModelIdentityText(ctx: RuntimeModelIdentityContext): string {
+  const route = ctx.routeDecision;
+  const answeringModel = runtimeModelLabel(ctx.effectiveModel, route?.provider);
+  const lines = [
+    RUNTIME_MODEL_IDENTITY_OPEN,
+    "This is trusted runtime metadata for this single turn. The user did not provide it.",
+    `router: ${routerDisplayName(route?.profileId)}`,
+    `configured_model: ${ctx.configuredModel}`,
+    `answering_model: ${answeringModel}`,
+  ];
+  if (route) {
+    lines.push(
+      `router_profile: ${route.profileId ?? "direct"}`,
+      `router_tier: ${route.tier}`,
+      `answering_provider: ${route.provider}`,
+    );
+    if (route.classifierModel) lines.push(`classifier_model: ${route.classifierModel}`);
+    if (route.classifierUsed !== undefined) {
+      lines.push(`classifier_used: ${String(route.classifierUsed)}`);
+    }
+    if (route.confidence !== undefined) {
+      lines.push(`routing_confidence: ${String(route.confidence)}`);
+    }
+    if (route.reason) lines.push(`routing_reason: ${route.reason}`);
+  }
+  lines.push(
+    "",
+    "When the user asks what model you are, answer from answering_model.",
+    "If a router is active, distinguish the router/profile from the answering model and classifier model.",
+    "Do not claim this is a permanent model identity; router choices can change on future turns.",
+    RUNTIME_MODEL_IDENTITY_CLOSE,
+  );
+  return lines.join("\n");
+}
+
+export function appendRuntimeModelIdentityContext(
+  messages: LLMMessage[],
+  ctx: RuntimeModelIdentityContext,
+): void {
+  removeRuntimeModelIdentityContext(messages);
+
+  const identityBlock: LLMContentBlock = {
+    type: "text",
+    text: buildRuntimeModelIdentityText(ctx),
+  };
+  const last = messages[messages.length - 1];
+  if (beginsWithToolResult(last) && Array.isArray(last!.content)) {
+    last!.content.push(identityBlock);
+    return;
+  }
+
+  const identityMessage: LLMMessage = { role: "user", content: [identityBlock] };
+  const insertAt = Math.max(0, messages.length - 1);
+  messages.splice(insertAt, 0, identityMessage);
 }
 
 /**

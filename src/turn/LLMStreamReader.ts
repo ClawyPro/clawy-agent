@@ -13,6 +13,7 @@ import type {
   LLMContentBlock,
   LLMEvent,
   LLMMessage,
+  LLMStreamRequest,
   LLMToolDef,
   LLMUsage,
 } from "../transport/LLMClient.js";
@@ -56,6 +57,8 @@ export interface LLMStreamReaderResult {
 export interface ReadOneOptions {
   /** Override thinking mode for this call (e.g. disable for empty-response recovery). */
   thinkingOverride?: { type: "adaptive" } | { type: "disabled" };
+  /** Non-authoritative routing metadata passed to LLM transport/proxy logs. */
+  routing?: LLMStreamRequest["routing"];
 }
 
 export async function readOne(
@@ -91,6 +94,7 @@ export async function readOne(
       tools: toolDefs.length ? toolDefs : undefined,
       ...(deps.abortSignal ? { signal: deps.abortSignal } : {}),
       ...(options?.thinkingOverride ? { thinking: options.thinkingOverride } : {}),
+      ...(options?.routing ? { routing: options.routing } : {}),
     });
   } catch (err) {
     deps.onError("llm_connect_failed", err);

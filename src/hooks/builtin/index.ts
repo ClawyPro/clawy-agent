@@ -95,6 +95,10 @@ import { makeTaskLifecycleHook } from "./taskLifecycle.js";
 import type { Discipline } from "../../Session.js";
 import type { PolicyKernel as PolicyKernelType } from "../../policy/PolicyKernel.js";
 import { makePolicyPromptBlockHook } from "./policyPromptBlock.js";
+import {
+  makeExecutionContractPromptHook,
+  makeExecutionContractVerifierHook,
+} from "./executionContract.js";
 import type { DebugWorkflow as DebugWorkflowType } from "../../debug/DebugWorkflow.js";
 import { makeDebugTurnClassifierHook } from "./debugTurnClassifier.js";
 import {
@@ -275,6 +279,12 @@ export function registerBuiltinHooks(
   const reliabilityPromptHook = makeReliabilityPromptInjectorHook();
   if (maybe(reliabilityPromptHook.name)) {
     registry.register(reliabilityPromptHook);
+    registered++;
+  }
+
+  const executionContractPromptHook = makeExecutionContractPromptHook();
+  if (maybe(executionContractPromptHook.name)) {
+    registry.register(executionContractPromptHook);
     registered++;
   }
 
@@ -564,6 +574,12 @@ export function registerBuiltinHooks(
   });
   if (maybe(taskContractGateHook.name)) {
     registry.register(taskContractGateHook);
+    registered++;
+  }
+
+  const executionContractVerifierHook = makeExecutionContractVerifierHook();
+  if (maybe(executionContractVerifierHook.name)) {
+    registry.register(executionContractVerifierHook);
     registered++;
   }
 

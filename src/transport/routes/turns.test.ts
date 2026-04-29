@@ -47,6 +47,10 @@ interface StubSessionWithInject extends StubSession {
   controlEvents?: ControlEventLedger;
 }
 
+interface StubActiveTurn {
+  resolveAsk(questionId: string, answer: { selectedId?: string; freeText?: string }): boolean;
+}
+
 interface StubAgent {
   config: { botId: string; workspaceRoot: string };
   auditLog: AuditLog;
@@ -57,7 +61,7 @@ interface StubAgent {
   sessionKeyIndex(): Map<string, string>;
   tools: { list(): []; skillReport(): null };
   hooks: { list(): [] };
-  getActiveTurn(): undefined;
+  getActiveTurn(turnId: string): StubActiveTurn | undefined;
   getSession?: (sessionKey: string) => StubSessionWithInject | undefined;
   hasActiveTurnForSession?: (sessionKey: string) => boolean;
   getOrCreateSession(
@@ -71,6 +75,8 @@ interface InjectStubState {
   activeSessions: Set<string>;
   /** sessionKey → session stub instance used by getSession(). */
   sessions: Map<string, StubSessionWithInject>;
+  /** turnId → active turn stub used by ask_user response tests. */
+  activeTurns: Map<string, StubActiveTurn>;
 }
 
 function makeStubAgent(
@@ -95,7 +101,7 @@ function makeStubAgent(
     sessionKeyIndex: () => new Map(),
     tools: { list: () => [], skillReport: () => null },
     hooks: { list: () => [] },
-    getActiveTurn: () => undefined,
+    getActiveTurn: (turnId) => injectState?.activeTurns.get(turnId),
     getSession: injectState
       ? (key) => injectState.sessions.get(key)
       : undefined,
@@ -466,6 +472,7 @@ describe("POST /v1/chat/inject", () => {
     injectState = {
       activeSessions: new Set(),
       sessions: new Map(),
+      activeTurns: new Map(),
     };
     const agent = makeStubAgent(tmp, undefined, injectState) as unknown as ConstructorParameters<
       typeof HttpServer
@@ -578,6 +585,7 @@ describe("POST /v1/chat/interrupt", () => {
     injectState = {
       activeSessions: new Set(),
       sessions: new Map(),
+      activeTurns: new Map(),
     };
     const agent = makeStubAgent(tmp, undefined, injectState) as unknown as ConstructorParameters<
       typeof HttpServer
@@ -660,6 +668,7 @@ describe("HttpServer /v1/control-requests", () => {
     state = {
       activeSessions: new Set(),
       sessions: new Map(),
+      activeTurns: new Map(),
     };
     const agent = makeStubAgent(tmp, undefined, state) as unknown as ConstructorParameters<
       typeof HttpServer
@@ -774,6 +783,36 @@ describe("HttpServer /v1/control-requests", () => {
     const body = JSON.parse(r.body) as { request: { state: string; answer: string } };
     expect(body.request.state).toBe("answered");
     expect(body.request.answer).toBe("report.md");
+  });
+
+  it("resolves legacy ask_user cards through the control-request response route", async () => {
+    const session = await makeControlSession(SESSION_KEY);
+    state.sessions.set(SESSION_KEY, session);
+    const resolved: Array<{
+      questionId: string;
+      answer: { selectedId?: string; freeText?: string };
+    }> = [];
+    state.activeTurns.set("turn_legacy", {
+      resolveAsk(questionId, answer) {
+        resolved.push({ questionId, answer });
+        return true;
+      },
+    });
+
+    const r = await postResponse("turn_legacy:ask:1", {
+      sessionKey: SESSION_KEY,
+      decision: "answered",
+      answer: "regenerate",
+    });
+
+    expect(r.status).toBe(200);
+    expect(JSON.parse(r.body)).toEqual({ ok: true });
+    expect(resolved).toEqual([
+      {
+        questionId: "turn_legacy:ask:1",
+        answer: { selectedId: "regenerate" },
+      },
+    ]);
   });
 
   it("duplicate responses return the original resolved state", async () => {

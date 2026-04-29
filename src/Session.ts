@@ -32,6 +32,7 @@ import {
   type ContextStats,
 } from "./Context.js";
 import { matchSlashCommand } from "./slash/registry.js";
+import { ExecutionContractStore } from "./execution/ExecutionContract.js";
 
 /**
  * Coding Discipline block (docs/plans/2026-04-20-coding-discipline-design.md).
@@ -221,6 +222,7 @@ export class Session {
   readonly controlEvents: ControlEventLedger;
   readonly controlRequests: ControlRequestStore;
   readonly planLifecycle: PlanLifecycle;
+  readonly executionContract: ExecutionContractStore;
   /** Legacy convenience accessor — returns the active context's
    * transcript so every pre-T4-19 call site keeps working unchanged. */
   get transcript(): Transcript {
@@ -328,6 +330,7 @@ export class Session {
       transcript: this.transcript,
     });
     this.controlRequests = new ControlRequestStore({ ledger: this.controlEvents });
+    this.executionContract = new ExecutionContractStore();
     this.planLifecycle = new PlanLifecycle({
       sessionKey: meta.sessionKey,
       channelName: meta.channel.channelId,
@@ -972,6 +975,7 @@ export class Session {
         }
       }
       await this.hydrateMetaIfNeeded();
+      this.executionContract.startTurn({ userMessage: userMessage.text });
       const active = this.getActiveContext();
       sse.agent({
         type: "context_activated",

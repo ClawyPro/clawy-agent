@@ -28,6 +28,7 @@ import {
 import type { DisciplineSessionCounter } from "./hooks/builtin/disciplineHook.js";
 import type { ChannelRef } from "./util/types.js";
 import { LLMClient } from "./transport/LLMClient.js";
+import { DirectLLMClient } from "./transport/DirectLLMClient.js";
 import { Workspace } from "./storage/Workspace.js";
 import { AuditLog } from "./storage/AuditLog.js";
 import { sessionFileName } from "./storage/TranscriptReader.js";
@@ -105,6 +106,8 @@ import {
   makePlanCommand,
 } from "./slash/superpowers.js";
 import { ResetCounterStore } from "./slash/resetCounters.js";
+import { RouterEngine } from "./routing/RouterEngine.js";
+import type { RoutingMode } from "./routing/types.js";
 
 /**
  * Lifecycle-level events emitted on the Agent-scoped event bus.
@@ -188,6 +191,15 @@ export interface AgentConfig {
   model: string;
   /** OSS multi-provider support — delegates LLM calls to this provider. */
   llmProvider?: { stream(req: import("./transport/LLMClient.js").LLMStreamRequest): AsyncGenerator<import("./transport/LLMClient.js").LLMEvent, void, void> };
+  /** Native router mode. Hosted mode still calls api-proxy for provider auth/billing. */
+  routingMode?: RoutingMode;
+  /** Built-in routing profile id, e.g. "standard" or "anthropic_only". */
+  routingProfileId?: string;
+  /** Standalone direct-provider config, only used by direct mode. */
+  directProviders?: Record<
+    string,
+    { kind: "anthropic" | "openai-compatible"; baseUrl: string; apiKey: string }
+  >;
   /** OSS identity — optional agent display name. */
   agentName?: string;
   /** OSS identity — optional custom instructions. */
@@ -253,6 +265,7 @@ export interface AgentConfig {
 export class Agent {
   readonly config: AgentConfig;
   readonly llm: LLMClient;
+  readonly router: RouterEngine | null;
   readonly workspace: Workspace;
   readonly tools: ToolRegistry;
   readonly intent: IntentClassifier;
@@ -338,15 +351,27 @@ export class Agent {
 
   constructor(config: AgentConfig) {
     this.config = config;
-    this.llm = config.llmProvider
-      ? LLMClient.fromProvider(config.llmProvider, config.model)
-      : new LLMClient({
-          apiProxyUrl: config.apiProxyUrl,
-          gatewayToken: config.gatewayToken,
-          codexAccessToken: config.codexAccessToken,
-          codexRefreshToken: config.codexRefreshToken,
-          defaultModel: config.model,
-        });
+    this.llm =
+      config.routingMode === "direct"
+        ? new DirectLLMClient({
+            providers: config.directProviders ?? {},
+          })
+        : config.llmProvider
+          ? LLMClient.fromProvider(config.llmProvider, config.model)
+          : new LLMClient({
+              apiProxyUrl: config.apiProxyUrl,
+              gatewayToken: config.gatewayToken,
+              codexAccessToken: config.codexAccessToken,
+              codexRefreshToken: config.codexRefreshToken,
+              defaultModel: config.model,
+            });
+    this.router =
+      config.routingMode === "hosted-proxy" || config.routingMode === "direct"
+        ? new RouterEngine({
+            llm: this.llm,
+            profileId: config.routingProfileId ?? "standard",
+          })
+        : null;
     this.workspace = new Workspace(config.workspaceRoot);
     this.policy = new PolicyKernel(this.workspace);
     this.debugWorkflow = new DebugWorkflow();

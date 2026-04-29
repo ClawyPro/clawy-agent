@@ -63,6 +63,13 @@ export interface LLMStreamRequest {
   thinking?: { type: "adaptive" } | { type: "disabled" };
   /** Cooperative cancellation for user interrupts / handoff. */
   signal?: AbortSignal;
+  /** Non-authoritative routing hints for observability at the proxy boundary. */
+  routing?: {
+    profileId: string;
+    tier: string;
+    provider: string;
+    confidence: string;
+  };
 }
 
 export interface LLMUsage {
@@ -97,13 +104,10 @@ function sanitizeToolUseId(raw: string): string {
 }
 
 export function normalizeToolUseIdsForRequest(messages: LLMMessage[]): LLMMessage[] {
-  const idMap = new Map<string, string>();
+  const pendingToolUseIds = new Map<string, string[]>();
   const used = new Set<string>();
 
-  const canonicalId = (raw: string): string => {
-    const existing = idMap.get(raw);
-    if (existing) return existing;
-
+  const nextUniqueId = (raw: string): string => {
     const base = sanitizeToolUseId(raw);
     let candidate = base;
     let suffix = 1;
@@ -111,9 +115,26 @@ export function normalizeToolUseIdsForRequest(messages: LLMMessage[]): LLMMessag
       candidate = `${base}_${suffix}`;
       suffix += 1;
     }
-    idMap.set(raw, candidate);
     used.add(candidate);
     return candidate;
+  };
+
+  const recordToolUse = (raw: string): string => {
+    const id = nextUniqueId(raw);
+    const pending = pendingToolUseIds.get(raw) ?? [];
+    pending.push(id);
+    pendingToolUseIds.set(raw, pending);
+    return id;
+  };
+
+  const consumeToolResult = (raw: string): string => {
+    const pending = pendingToolUseIds.get(raw);
+    if (pending && pending.length > 0) {
+      const id = pending.shift()!;
+      if (pending.length === 0) pendingToolUseIds.delete(raw);
+      return id;
+    }
+    return nextUniqueId(raw);
   };
 
   return messages.map((msg) => {
@@ -124,13 +145,13 @@ export function normalizeToolUseIdsForRequest(messages: LLMMessage[]): LLMMessag
         if (block.type === "tool_use") {
           return {
             ...block,
-            id: canonicalId(block.id),
+            id: recordToolUse(block.id),
           };
         }
         if (block.type === "tool_result") {
           return {
             ...block,
-            tool_use_id: canonicalId(block.tool_use_id),
+            tool_use_id: consumeToolResult(block.tool_use_id),
           };
         }
         return block;
@@ -275,7 +296,13 @@ export class LLMClient {
       (shouldEnableThinkingByDefault(model)
         ? ({ type: "adaptive" } as const)
         : undefined);
-    const normalizedMessages = normalizeToolUseIdsForRequest(req.messages);
+    const normalizedMessages = normalizeToolUseIdsForRequest(req.messages).map((msg) => {
+      if (!Array.isArray(msg.content)) return msg;
+      const filtered = (msg.content as Array<Record<string, unknown>>).filter(
+        (block) => block.type !== "text" || (typeof block.text === "string" && block.text.length > 0),
+      );
+      return filtered.length > 0 ? { ...msg, content: filtered } : msg;
+    });
     const body = JSON.stringify({
       model,
       system: req.system,
@@ -289,6 +316,14 @@ export class LLMClient {
 
     const url = new URL("/v1/messages", this.opts.apiProxyUrl);
     const lib = url.protocol === "https:" ? https : http;
+    const routingHeaders = req.routing
+      ? {
+          "x-clawy-router-profile": req.routing.profileId,
+          "x-clawy-router-tier": req.routing.tier,
+          "x-clawy-router-provider": req.routing.provider,
+          "x-clawy-router-confidence": req.routing.confidence,
+        }
+      : {};
     const reqOptions: http.RequestOptions = {
       method: "POST",
       protocol: url.protocol,
@@ -307,6 +342,7 @@ export class LLMClient {
         ...(usesCodexOAuth && this.opts.codexRefreshToken
           ? { "x-openai-codex-refresh-token": this.opts.codexRefreshToken }
           : {}),
+        ...routingHeaders,
       },
       timeout: this.opts.timeoutMs,
     };
@@ -453,7 +489,7 @@ async function consumeText(res: http.IncomingMessage, signal?: AbortSignal): Pro
  *
  *   event: message_stop
  */
-async function* parseAnthropicSse(
+export async function* parseAnthropicSse(
   res: http.IncomingMessage,
 ): AsyncGenerator<LLMEvent, void, void> {
   let buffer = "";

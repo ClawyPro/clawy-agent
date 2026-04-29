@@ -48,9 +48,15 @@ describe("ExitPlanMode tool", () => {
   });
 
   it("errors when invoked outside of plan mode", async () => {
+    const submitPlan = vi.fn(async () => ({
+      planApproved: false as const,
+      planId: "unused",
+      requestId: "unused",
+      state: "awaiting_approval" as const,
+    }));
     const controller: PlanModeController = {
       isPlanMode: () => false,
-      exitPlanMode: vi.fn(),
+      submitPlan,
     };
     const tool = makeExitPlanModeTool(() => controller);
     const result = await tool.execute(
@@ -59,17 +65,29 @@ describe("ExitPlanMode tool", () => {
     );
     expect(result.status).toBe("error");
     expect(result.errorCode).toBe("not_in_plan_mode");
-    expect(controller.exitPlanMode).not.toHaveBeenCalled();
+    expect(submitPlan).not.toHaveBeenCalled();
   });
 
-  it("emits plan_ready event, flips the flag, and reports approval", async () => {
+  it("submits plan for approval and keeps plan mode active", async () => {
     let flag = true;
-    const exitSpy = vi.fn(() => {
-      flag = false;
+    const submitSpy = vi.fn(async (input: { turnId: string; plan: string; emitAgentEvent?: (e: unknown) => void }) => {
+      input.emitAgentEvent?.({
+        type: "plan_ready",
+        planId: "plan-1",
+        requestId: "req-1",
+        state: "awaiting_approval",
+        plan: input.plan,
+      });
+      return {
+        planApproved: false as const,
+        planId: "plan-1",
+        requestId: "req-1",
+        state: "awaiting_approval" as const,
+      };
     });
     const controller: PlanModeController = {
       isPlanMode: () => flag,
-      exitPlanMode: exitSpy,
+      submitPlan: submitSpy,
     };
     const tool = makeExitPlanModeTool(() => controller);
     const events: unknown[] = [];
@@ -78,11 +96,22 @@ describe("ExitPlanMode tool", () => {
       makeCtx((e) => events.push(e)),
     );
     expect(result.status).toBe("ok");
-    expect(result.output).toEqual({ planApproved: true });
-    expect(exitSpy).toHaveBeenCalledOnce();
+    expect(result.output).toEqual({
+      planApproved: false,
+      planId: "plan-1",
+      requestId: "req-1",
+      state: "awaiting_approval",
+    });
+    expect(submitSpy).toHaveBeenCalledOnce();
     expect(events).toEqual([
-      { type: "plan_ready", plan: "## Plan\n- step A\n- step B" },
+      {
+        type: "plan_ready",
+        planId: "plan-1",
+        requestId: "req-1",
+        state: "awaiting_approval",
+        plan: "## Plan\n- step A\n- step B",
+      },
     ]);
-    expect(flag).toBe(false);
+    expect(flag).toBe(true);
   });
 });
