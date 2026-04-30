@@ -66,6 +66,16 @@ describe("PermissionArbiter", () => {
       decideRuntimePermission({
         mode: "bypass",
         source: "turn",
+        toolName: "FileWrite",
+        input: { path: "LEARNING.md", content: "x" },
+        tool: tool("FileWrite", "write"),
+        workspaceRoot: root,
+      }),
+    ).resolves.toMatchObject({ decision: "deny" });
+    await expect(
+      decideRuntimePermission({
+        mode: "bypass",
+        source: "turn",
         toolName: "FileRead",
         input: { path: ".env" },
         tool: tool("FileRead", "read"),

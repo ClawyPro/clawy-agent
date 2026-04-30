@@ -45,6 +45,7 @@ export const DEFAULT_SEALED_GLOBS: readonly string[] = [
   "TOOLS.md",
   "CLAUDE.md",
   "HEARTBEAT.md",
+  "LEARNING.md",
   "identity.md",
   "rules.md",
   "soul.md",
@@ -75,6 +76,7 @@ interface PendingUpdate {
  * the two hooks fire in sequence on the same turn.
  */
 const PENDING_UPDATES_BY_TURN = new Map<string, PendingUpdate[]>();
+const SYSTEM_ALLOWED_UPDATES_BY_TURN = new Map<string, Set<string>>();
 
 /**
  * Sealed files can already differ from the manifest before a turn
@@ -83,6 +85,14 @@ const PENDING_UPDATES_BY_TURN = new Map<string, PendingUpdate[]>();
  * only blocks changes made after this turn began.
  */
 const PREEXISTING_DRIFT_BY_TURN = new Map<string, Map<string, string>>();
+
+export function allowSealedFileUpdateForTurn(turnId: string, relPath: string): void {
+  const normalised = relPath.replace(/\\/g, "/").replace(/^\.\//, "").replace(/^\/+/, "");
+  if (!turnId || normalised.length === 0) return;
+  const paths = SYSTEM_ALLOWED_UPDATES_BY_TURN.get(turnId) ?? new Set<string>();
+  paths.add(normalised);
+  SYSTEM_ALLOWED_UPDATES_BY_TURN.set(turnId, paths);
+}
 
 function isEnabledByEnv(): boolean {
   const raw = process.env.CORE_AGENT_SEALED_FILES;
@@ -354,6 +364,7 @@ function makeBeforeTurnStartHook(opts: SealedFilesOptions): RegisteredHook<"befo
     timeoutMs: 5_000,
     handler: async (_args, ctx: HookContext) => {
       PREEXISTING_DRIFT_BY_TURN.delete(ctx.turnId);
+      SYSTEM_ALLOWED_UPDATES_BY_TURN.delete(ctx.turnId);
       if (!isEnabledByEnv()) return { action: "continue" };
 
       const config = await readConfig(opts.workspaceRoot);
@@ -433,11 +444,13 @@ function makeBeforeCommitHook(opts: SealedFilesOptions): RegisteredHook<"beforeC
       const turnAllowed = configTurnAllowlist.includes(ctx.turnId);
       const unsealPatterns = extractUnsealPatterns(userMessage);
       const preexistingDrift = PREEXISTING_DRIFT_BY_TURN.get(ctx.turnId);
+      const systemAllowed = SYSTEM_ALLOWED_UPDATES_BY_TURN.get(ctx.turnId);
 
       const violations: string[] = [];
       const bypassedByConfig: string[] = [];
       const bypassedByUnseal: Array<{ path: string; pattern: string }> = [];
       const bypassedAsPreexisting: string[] = [];
+      const bypassedBySystem: string[] = [];
       const pendingUpdates: PendingUpdate[] = [];
 
       for (const ch of diff.changed) {
@@ -448,6 +461,11 @@ function makeBeforeCommitHook(opts: SealedFilesOptions): RegisteredHook<"beforeC
         }
         if (turnAllowed) {
           bypassedByConfig.push(ch.path);
+          if (ch.sha256 !== "") pendingUpdates.push({ path: ch.path, sha256: ch.sha256 });
+          continue;
+        }
+        if (systemAllowed?.has(ch.path)) {
+          bypassedBySystem.push(ch.path);
           if (ch.sha256 !== "") pendingUpdates.push({ path: ch.path, sha256: ch.sha256 });
           continue;
         }
@@ -504,6 +522,18 @@ function makeBeforeCommitHook(opts: SealedFilesOptions): RegisteredHook<"beforeC
           path: p,
         });
       }
+      for (const p of bypassedBySystem) {
+        ctx.emit({
+          type: "rule_check",
+          ruleId: "sealed-files",
+          verdict: "ok",
+          detail: `sealed_files_bypass kind=system path=${p}`,
+        });
+        ctx.log("info", "[sealedFiles] sealed_files_bypass (system)", {
+          turnId: ctx.turnId,
+          path: p,
+        });
+      }
 
       if (violations.length > 0) {
         ctx.emit({
@@ -520,6 +550,7 @@ function makeBeforeCommitHook(opts: SealedFilesOptions): RegisteredHook<"beforeC
         // should not silently persist the allowed half.
         PENDING_UPDATES_BY_TURN.delete(ctx.turnId);
         PREEXISTING_DRIFT_BY_TURN.delete(ctx.turnId);
+        SYSTEM_ALLOWED_UPDATES_BY_TURN.delete(ctx.turnId);
 
         // Circuit-breaker integration: record the repeated failure so
         // a retry cascade (new turnId per attempt) hits the cooldown
@@ -587,6 +618,7 @@ function makeAfterCommitHook(opts: SealedFilesOptions): RegisteredHook<"afterCom
       const pending = PENDING_UPDATES_BY_TURN.get(ctx.turnId);
       PENDING_UPDATES_BY_TURN.delete(ctx.turnId);
       PREEXISTING_DRIFT_BY_TURN.delete(ctx.turnId);
+      SYSTEM_ALLOWED_UPDATES_BY_TURN.delete(ctx.turnId);
       if (!isEnabledByEnv()) return;
       if (!pending || pending.length === 0) return;
       const manifest = (await readManifest(opts.workspaceRoot)) ?? {};
@@ -630,6 +662,7 @@ export const __testing = {
   clearPending: (): void => {
     PENDING_UPDATES_BY_TURN.clear();
     PREEXISTING_DRIFT_BY_TURN.clear();
+    SYSTEM_ALLOWED_UPDATES_BY_TURN.clear();
   },
   getPending: (turnId: string): ReadonlyArray<PendingUpdate> | undefined =>
     PENDING_UPDATES_BY_TURN.get(turnId),

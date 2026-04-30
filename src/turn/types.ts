@@ -26,6 +26,7 @@ export type TurnStopReason =
   | "permission_timeout"
   | "budget_exceeded"
   | "compaction_impossible"
+  | "empty_response_retry_exhausted"
   | "structured_output_retry_exhausted"
   | "aborted";
 

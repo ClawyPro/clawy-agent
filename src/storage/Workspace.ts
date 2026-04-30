@@ -16,6 +16,8 @@ export interface WorkspaceIdentity {
   bootstrap?: string;
   /** SOUL.md — main agent spec / persona / rules. */
   soul?: string;
+  /** LEARNING.md — platform-owned learning/procedural-memory contract. */
+  learning?: string;
   /** IDENTITY.md — extended bio / role definition. */
   identity?: string;
   /** USER.md — user profile (preferences, role, language). */
@@ -68,10 +70,11 @@ export class Workspace {
   }
 
   async loadIdentity(): Promise<WorkspaceIdentity> {
-    const [bootstrap, soul, identity, user, agents, tools, userRulesRaw] =
+    const [bootstrap, soul, learning, identity, user, agents, tools, userRulesRaw] =
       await Promise.all([
         this.readSafe("BOOTSTRAP.md"),
         this.readSafe("SOUL.md"),
+        this.readSafe("LEARNING.md"),
         this.readSafe("IDENTITY.md"),
         this.readSafe("USER.md"),
         this.readSafe("AGENTS.md"),
@@ -90,7 +93,7 @@ export class Workspace {
           ? `${userRulesRaw.slice(0, USER_RULES_MAX_CHARS)}\n[truncated]`
           : userRulesRaw;
     }
-    return { bootstrap, soul, identity, user, agents, tools, userRules };
+    return { bootstrap, soul, learning, identity, user, agents, tools, userRules };
   }
 
   async loadMemoryIndex(): Promise<WorkspaceMemory> {
@@ -137,7 +140,7 @@ export class Workspace {
  * Render the identity block into a single system-prompt string.
  *
  * Order (§9.5 + SOUL.md convention):
- *   BOOTSTRAP → SOUL → IDENTITY → USER → AGENTS → TOOLS
+ *   BOOTSTRAP → SOUL → LEARNING → IDENTITY → USER → AGENTS → TOOLS
  *
  * Missing files are omitted, not replaced with "<missing>". Each file
  * is wrapped in a clear section header so the model can distinguish.
@@ -150,6 +153,7 @@ export function renderIdentitySystem(id: WorkspaceIdentity): string {
   };
   push("BOOTSTRAP", id.bootstrap);
   push("SOUL", id.soul);
+  push("LEARNING", id.learning);
   push("IDENTITY", id.identity);
   push("USER", id.user);
   push("AGENTS", id.agents);

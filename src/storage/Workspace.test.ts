@@ -68,7 +68,46 @@ describe("Workspace.loadIdentity — USER-RULES.md", () => {
   });
 });
 
+describe("Workspace.loadIdentity — LEARNING.md", () => {
+  let root: string;
+
+  beforeEach(async () => {
+    root = await fs.mkdtemp(path.join(os.tmpdir(), "ws-learning-"));
+  });
+  afterEach(async () => {
+    await fs.rm(root, { recursive: true, force: true });
+  });
+
+  it("returns learning when LEARNING.md exists with content", async () => {
+    await fs.writeFile(
+      path.join(root, "LEARNING.md"),
+      "# Learning Protocol\n\nHipocampus remains primary memory.",
+      "utf8",
+    );
+    const ws = new Workspace(root);
+    const id = await ws.loadIdentity();
+    expect(id.learning).toContain("Hipocampus remains primary memory");
+  });
+});
+
 describe("renderIdentitySystem — runtime policy handoff", () => {
+  it("renders LEARNING after SOUL and before IDENTITY", () => {
+    const out = renderIdentitySystem({
+      soul: "soul body",
+      learning: "learning body",
+      identity: "identity body",
+    });
+
+    const soulIndex = out.indexOf("# SOUL");
+    const learningIndex = out.indexOf("# LEARNING");
+    const identityIndex = out.indexOf("# IDENTITY");
+
+    expect(soulIndex).toBeGreaterThanOrEqual(0);
+    expect(learningIndex).toBeGreaterThan(soulIndex);
+    expect(identityIndex).toBeGreaterThan(learningIndex);
+    expect(out).toContain("learning body");
+  });
+
   it("does not append raw <agent_rules> blocks after identity sections", () => {
     const out = renderIdentitySystem({
       identity: "I am a bot",

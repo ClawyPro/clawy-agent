@@ -36,6 +36,7 @@ import { Transcript } from "./storage/Transcript.js";
 import type { AuditLog } from "./storage/AuditLog.js";
 import { SseWriter } from "./transport/SseWriter.js";
 import type { Session } from "./Session.js";
+import type { RouteDecision } from "./routing/types.js";
 
 // ─────────────────────────────────────────────────────────────────────
 // Scripted stream shape: one entry per iteration the model would run.
@@ -153,7 +154,12 @@ interface Fixture {
 
 async function makeFixture(
   script: ScriptedTurn[],
-  opts: { pendingInjections?: boolean[]; toolNames?: string[] } = {},
+  opts: {
+    pendingInjections?: boolean[];
+    toolNames?: string[];
+    model?: string;
+    router?: { resolve: (input: unknown) => Promise<RouteDecision> };
+  } = {},
 ): Promise<Fixture> {
   const workspaceRoot = await fs.mkdtemp(
     path.join(os.tmpdir(), "turn-stopreason-"),
@@ -246,7 +252,7 @@ async function makeFixture(
     apiProxyUrl: "http://localhost",
     chatProxyUrl: "http://localhost",
     redisUrl: "redis://localhost",
-    model: "claude-opus-4-7",
+    model: opts.model ?? "claude-opus-4-7",
   };
 
   // T1-02 compaction_boundary — ContextEngine stub that never
@@ -259,6 +265,7 @@ async function makeFixture(
 
   const agentStub = {
     config,
+    router: opts.router ?? null,
     hooks,
     tools: toolRegistry,
     intent,
@@ -381,6 +388,50 @@ describe("Turn.execute() stop-reason taxonomy", () => {
           (event as { type?: string }).type === "response_clear",
       ),
     ).toBe(true);
+  });
+
+  it("falls back to a text model instead of committing empty output after empty-response retries", async () => {
+    const geminiDecision: RouteDecision = {
+      profileId: "premium",
+      tier: "DEEP",
+      provider: "google",
+      model: "gemini-3.1-pro-preview",
+      supportsTools: true,
+      supportsImages: true,
+      reason: "premium deep",
+      classifierUsed: true,
+      classifierModel: "claude-sonnet-4-6",
+      classifierRaw: "DEEP",
+      confidence: "classifier",
+    };
+    const empty = { blocks: [], stopReason: "end_turn" as const };
+    const { turn, llm, auditEvents } = await makeFixture(
+      [
+        empty,
+        empty,
+        empty,
+        empty,
+        { blocks: [{ type: "text", text: "Recovered with visible text." }], stopReason: "end_turn" },
+      ],
+      {
+        model: "clawy-smart-router/auto",
+        router: { resolve: async () => geminiDecision },
+      },
+    );
+
+    await turn.execute();
+    const commit = await turn.commit();
+
+    expect(commit.finalText).toBe("Recovered with visible text.");
+    expect(llm.calls.map((call) => call.model)).toEqual([
+      "gemini-3.1-pro-preview",
+      "gemini-3.1-pro-preview",
+      "gemini-3.1-pro-preview",
+      "gemini-3.1-pro-preview",
+      "claude-haiku-4-5-20251001",
+    ]);
+    expect(auditEvents.some((event) => event.event === "empty_response_fallback")).toBe(true);
+    expect(turn.meta.stopReason).toBe("end_turn");
   });
 
   it("tool_use → runs tools then terminates on end_turn", async () => {

@@ -10,6 +10,7 @@
 import type { RegisteredHook } from "../types.js";
 import type { TranscriptEntry } from "../../storage/Transcript.js";
 import { flushMemory as defaultFlushMemory } from "./hipocampusFlush.js";
+import { allowSealedFileUpdateForTurn } from "./sealedFiles.js";
 
 export interface CompactionEngine {
   run: (force?: boolean) => Promise<{ skipped?: boolean; compacted?: boolean; stats?: unknown }>;
@@ -76,6 +77,7 @@ export function makeHipocampusCompactorHook(
         });
 
         if (result.compacted) {
+          allowSealedFileUpdateForTurn(ctx.turnId, "memory/ROOT.md");
           try {
             await qmd.reindex();
             ctx.log("info", "hipocampus qmd reindex completed", { sessionKey });
