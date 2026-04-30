@@ -54,6 +54,7 @@ const INTERNAL_BASENAMES = new Set([
   "AGENTS.md",
   "CLAUDE.md",
   "HEARTBEAT.md",
+  "LEARNING.md",
   "MEMORY.md",
   "SOUL.md",
   "TOOLS.md",
@@ -75,11 +76,25 @@ const FILE_INTENT_RE =
 
 const ARTIFACT_CLAIM_RE =
   /(?:파일|문서|리포트|보고서|엑셀|스프레드시트|PDF|CSV|artifact|file|document|report|spreadsheet|workbook).{0,40}(?:생성|작성|만들|저장|준비|created|generated|wrote|saved|prepared)/i;
+const NATIVE_TOOL_CLAIM_DONE_RE =
+  /(?:완료|했습니다|됐|되었습니다|생성|작성|저장|첨부|전달|delivered|sent|created|generated|saved|completed|done)/i;
+
+const NATIVE_OUTPUT_TOOLS = [
+  "DocumentWrite",
+  "SpreadsheetWrite",
+  "FileDeliver",
+] as const;
 
 interface DeliveryIntent {
   wantsAttachment: boolean;
   wantsKb: boolean;
   wantsFile: boolean;
+}
+
+interface NativeFileDelivery {
+  target: "chat" | "kb";
+  status?: string;
+  marker?: string;
 }
 
 export interface CreatedArtifact {
@@ -217,6 +232,32 @@ function artifactFromArtifactTool(
   };
 }
 
+function artifactFromOutputTool(
+  entry: Extract<TranscriptEntry, { kind: "tool_call" }>,
+  result: Extract<TranscriptEntry, { kind: "tool_result" }>,
+): CreatedArtifact | null {
+  const input = objectRecord(entry.input);
+  const output = parseOutputObject(result.output);
+  const rawPath =
+    stringField(output, "workspacePath") ??
+    stringField(output, "path") ??
+    stringField(input, "filename");
+  const filename = stringField(output, "filename") ?? stringField(input, "filename");
+  const artifactId = stringField(output, "artifactId");
+  const title = stringField(input, "title");
+  const name = filename ?? (rawPath ? basenameForPath(rawPath) : title ?? artifactId ?? "artifact");
+
+  if (!isUserFacingFile(rawPath ?? name)) return null;
+
+  return {
+    kind: "artifact",
+    name,
+    ...(rawPath ? { path: rawPath } : {}),
+    ...(artifactId ? { artifactId } : {}),
+    toolName: entry.name,
+  };
+}
+
 export function collectCreatedArtifacts(
   transcript: ReadonlyArray<TranscriptEntry>,
   turnId: string,
@@ -240,10 +281,107 @@ export function collectCreatedArtifacts(
     if (entry.name === "ArtifactCreate" || entry.name === "ArtifactUpdate") {
       const artifact = artifactFromArtifactTool(entry, result);
       if (artifact) artifacts.push(artifact);
+      continue;
+    }
+
+    if (entry.name === "DocumentWrite" || entry.name === "SpreadsheetWrite") {
+      const artifact = artifactFromOutputTool(entry, result);
+      if (artifact) artifacts.push(artifact);
     }
   }
 
   return artifacts;
+}
+
+function successfulToolNames(
+  transcript: ReadonlyArray<TranscriptEntry>,
+  turnId: string,
+): Set<string> {
+  const successful = successfulResultsById(transcript, turnId);
+  const names = new Set<string>();
+  for (const entry of transcript) {
+    if (entry.kind !== "tool_call") continue;
+    if (entry.turnId !== turnId) continue;
+    if (successful.has(entry.toolUseId)) names.add(entry.name);
+  }
+  return names;
+}
+
+function nativeToolCompletionClaimsWithoutEvidence(
+  assistantText: string,
+  transcript: ReadonlyArray<TranscriptEntry>,
+  turnId: string,
+): string[] {
+  if (!assistantText.trim()) return [];
+
+  const successful = successfulToolNames(transcript, turnId);
+  return NATIVE_OUTPUT_TOOLS.filter((toolName) => {
+    const at = assistantText.indexOf(toolName);
+    if (at < 0) return false;
+    const window = assistantText.slice(Math.max(0, at - 80), at + toolName.length + 120);
+    return NATIVE_TOOL_CLAIM_DONE_RE.test(window) && !successful.has(toolName);
+  });
+}
+
+function nativeFileDeliveries(
+  transcript: ReadonlyArray<TranscriptEntry>,
+  turnId: string,
+): NativeFileDelivery[] {
+  const successful = successfulResultsById(transcript, turnId);
+  const deliveries: NativeFileDelivery[] = [];
+
+  for (const entry of transcript) {
+    if (entry.kind !== "tool_call") continue;
+    if (entry.turnId !== turnId) continue;
+    if (entry.name !== "FileDeliver") continue;
+
+    const result = successful.get(entry.toolUseId);
+    if (!result) continue;
+    const output = parseOutputObject(result.output);
+    const rawDeliveries = output?.deliveries;
+    if (!Array.isArray(rawDeliveries)) continue;
+
+    for (const raw of rawDeliveries) {
+      const delivery = objectRecord(raw);
+      const target = delivery?.target;
+      if (target !== "chat" && target !== "kb") continue;
+      deliveries.push({
+        target,
+        status: stringField(delivery, "status") ?? undefined,
+        marker: stringField(delivery, "marker") ?? undefined,
+      });
+    }
+  }
+
+  return deliveries;
+}
+
+function sentNativeFileDeliveries(
+  transcript: ReadonlyArray<TranscriptEntry>,
+  turnId: string,
+): NativeFileDelivery[] {
+  return nativeFileDeliveries(transcript, turnId).filter(
+    (delivery) => delivery.status === "sent",
+  );
+}
+
+function sentNativeChatMarkers(
+  transcript: ReadonlyArray<TranscriptEntry>,
+  turnId: string,
+): string[] {
+  return sentNativeFileDeliveries(transcript, turnId)
+    .filter((delivery) => delivery.target === "chat" && delivery.marker)
+    .map((delivery) => delivery.marker as string);
+}
+
+function missingNativeChatMarkers(
+  assistantText: string,
+  transcript: ReadonlyArray<TranscriptEntry>,
+  turnId: string,
+): string[] {
+  return sentNativeChatMarkers(transcript, turnId).filter(
+    (marker) => !assistantText.includes(marker),
+  );
 }
 
 function successfulBashCommands(
@@ -268,6 +406,9 @@ export function hasKbWriteEvidence(
   transcript: ReadonlyArray<TranscriptEntry>,
   turnId: string,
 ): boolean {
+  if (sentNativeFileDeliveries(transcript, turnId).some((delivery) => delivery.target === "kb")) {
+    return true;
+  }
   return successfulBashCommands(transcript, turnId).some((command) =>
     /(?:\bkb-write\.sh\b|knowledge-write\/(?:add|update|create-collection)|integration\.sh[\s\S]{0,120}knowledge-write)/i.test(
       command,
@@ -291,13 +432,16 @@ function hasRequiredDeliveryEvidence(
   turnId: string,
 ): boolean {
   const hasAttachment = ATTACHMENT_MARKER_RE.test(assistantText);
+  const nativeMarkers = sentNativeChatMarkers(transcript, turnId);
+  const hasRequiredNativeMarker =
+    nativeMarkers.length === 0 || nativeMarkers.some((marker) => assistantText.includes(marker));
   const hasKbWrite = hasKbWriteEvidence(transcript, turnId);
 
-  if (intent.wantsAttachment && !hasAttachment) return false;
+  if (intent.wantsAttachment && (!hasAttachment || !hasRequiredNativeMarker)) return false;
   if (intent.wantsKb && !hasKbWrite) return false;
   if (intent.wantsAttachment || intent.wantsKb) return true;
 
-  return hasAttachment || hasKbWrite;
+  return (hasAttachment && hasRequiredNativeMarker) || hasKbWrite;
 }
 
 function describeMissingEvidence(
@@ -308,16 +452,23 @@ function describeMissingEvidence(
 ): string {
   const hasAttachment = ATTACHMENT_MARKER_RE.test(assistantText);
   const hasKbWrite = hasKbWriteEvidence(transcript, turnId);
+  const missingMarkers = missingNativeChatMarkers(assistantText, transcript, turnId);
   const missing: string[] = [];
 
-  if (intent.wantsAttachment && !hasAttachment) {
-    missing.push("chat attachment marker from file-send.sh");
+  if (intent.wantsAttachment && (!hasAttachment || missingMarkers.length > 0)) {
+    missing.push(
+      missingMarkers.length > 0
+        ? `returned FileDeliver marker in final answer: ${missingMarkers[0]}`
+        : "chat attachment marker from file-send.sh or FileDeliver",
+    );
   }
   if (intent.wantsKb && !hasKbWrite) {
-    missing.push("KB-write evidence from kb-write.sh or knowledge-write");
+    missing.push("KB-write evidence from kb-write.sh, knowledge-write, or FileDeliver(target=\"kb\")");
   }
   if (!intent.wantsAttachment && !intent.wantsKb && !hasAttachment && !hasKbWrite) {
     missing.push("chat attachment marker or KB-write evidence");
+  } else if (!intent.wantsAttachment && missingMarkers.length > 0) {
+    missing.push(`returned FileDeliver marker in final answer: ${missingMarkers[0]}`);
   }
 
   return missing.join("; ");
@@ -375,6 +526,50 @@ export function makeArtifactDeliveryGateHook(
         const transcript = await readTranscript(opts, ctx);
         const artifacts = collectCreatedArtifacts(transcript, ctx.turnId);
         const intent = classifyDeliveryIntent(userMessage);
+        const unsupportedNativeClaims = nativeToolCompletionClaimsWithoutEvidence(
+          assistantText,
+          transcript,
+          ctx.turnId,
+        );
+        if (unsupportedNativeClaims.length > 0) {
+          ctx.emit({
+            type: "rule_check",
+            ruleId: "artifact-delivery-gate",
+            verdict: "violation",
+            detail: `native tool claim without successful tool result: ${unsupportedNativeClaims.join(", ")}`,
+          });
+          return {
+            action: "block",
+            reason: [
+              "[RETRY:ARTIFACT_DELIVERY] The final answer claims native output tools completed,",
+              "but the current turn transcript has no matching successful tool results.",
+              "",
+              `Missing tool evidence: ${unsupportedNativeClaims.join(", ")}`,
+              "",
+              "Before finalising, either call the native tool(s), or remove the success claim and state the actual status.",
+            ].join("\n"),
+          };
+        }
+
+        const missingDeliveredMarkers = missingNativeChatMarkers(assistantText, transcript, ctx.turnId);
+        if (missingDeliveredMarkers.length > 0 && (intent.wantsAttachment || ATTACHMENT_INTENT_RE.test(assistantText))) {
+          ctx.emit({
+            type: "rule_check",
+            ruleId: "artifact-delivery-gate",
+            verdict: "violation",
+            detail: "FileDeliver returned a chat marker that is missing from the final answer",
+          });
+          return {
+            action: "block",
+            reason: [
+              "[RETRY:ARTIFACT_DELIVERY] FileDeliver uploaded a chat attachment,",
+              "but the final answer does not include the returned attachment marker, so the client cannot render it.",
+              "",
+              `Include this exact marker in the final answer: ${missingDeliveredMarkers[0]}`,
+            ].join("\n"),
+          };
+        }
+
         if (!shouldGate(intent, assistantText, artifacts)) {
           return { action: "continue" };
         }
@@ -420,8 +615,8 @@ export function makeArtifactDeliveryGateHook(
             formatArtifacts(artifacts),
             "",
             "Before finalising:",
-            "1) For web/app chat delivery, run `file-send.sh <path> <channel>` and include the exact `[attachment:<id>:<filename>]` marker in the reply.",
-            "2) If the user asked for KB persistence, run `kb-write.sh --add <collection> <filename> --stdin` (or the knowledge-write integration) before claiming it is saved.",
+            "1) For web/app chat delivery, call `FileDeliver(target=\"chat\")` or run `file-send.sh <path> <channel>`, then include the exact returned `[attachment:<id>:<filename>]` marker in the reply.",
+            "2) If the user asked for KB persistence, call `FileDeliver(target=\"kb\")`, run `kb-write.sh --add <collection> <filename> --stdin`, or use the knowledge-write integration before claiming it is saved.",
             "3) If delivery is temporarily unavailable after retrying, state that explicitly and provide the best available path/reference without claiming attachment or KB save.",
           ].join("\n"),
         };

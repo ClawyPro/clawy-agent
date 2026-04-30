@@ -44,6 +44,13 @@ export { MAX_OUTPUT_TOKENS_RECOVERY_LIMIT, classifyStopReason, type StopReasonCa
 
 /** Case-insensitive `[PLAN_MODE: on]` header trigger. */
 export const PLAN_MODE_HEADER_RE = /\[PLAN_MODE:\s*on\]/i;
+const DEFAULT_EMPTY_RESPONSE_FALLBACK_MODEL = "claude-haiku-4-5-20251001";
+
+function emptyResponseFallbackModel(): string | null {
+  const raw = process.env.CORE_AGENT_EMPTY_RESPONSE_FALLBACK_MODEL?.trim();
+  if (raw && /^(?:off|none|disabled)$/i.test(raw)) return null;
+  return raw && raw.length > 0 ? raw : DEFAULT_EMPTY_RESPONSE_FALLBACK_MODEL;
+}
 
 export class TurnInterruptedError extends Error {
   readonly handoffRequested: boolean;
@@ -111,6 +118,9 @@ export class Turn {
   static readonly MAX_TRUNCATION_RETRIES = 2;
   /** When true, the next LLM call disables thinking to force text output. */
   private forceNoThinking = false;
+  /** One-shot model override used only after repeated empty visible output. */
+  private emptyResponseModelOverride: string | null = null;
+  private emptyResponseFallbackUsed = false;
   /** Runtime model resolved once at turn start. */
   private runtimeModel: string | null = null;
   /** Gap §11.3 unknown-tool hallucination counter — shared across every
@@ -387,6 +397,49 @@ export class Turn {
             this.forceNoThinking = true; // Force text-only output on recovery
             iter -= 1;
             continue;
+          }
+          if (!hasText) {
+            const currentModel = this.currentModel();
+            const fallbackModel = emptyResponseFallbackModel();
+            if (
+              !this.emptyResponseFallbackUsed &&
+              fallbackModel &&
+              fallbackModel !== currentModel
+            ) {
+              this.emptyResponseFallbackUsed = true;
+              this.emptyResponseModelOverride = fallbackModel;
+              this.meta.routeDecision = undefined;
+              this.stageAuditEvent("empty_response_fallback", {
+                from: currentModel,
+                to: fallbackModel,
+                retries: this.emptyResponseRetry,
+              });
+              console.warn(
+                `[core-agent] empty-response fallback model activated` +
+                ` from=${currentModel} to=${fallbackModel}` +
+                ` retries=${this.emptyResponseRetry}` +
+                ` turnId=${this.meta.turnId}`,
+              );
+              messages.push({
+                role: "user",
+                content:
+                  "The previous answering model produced no visible text after multiple retries. Retry once using the fallback text model. Use tools if needed, then write the user-visible answer directly as plain text.",
+              });
+              this.forceNoThinking = true;
+              iter -= 1;
+              continue;
+            }
+            const err = new Error(
+              `empty response retry exhausted after ${this.emptyResponseRetry} retries`,
+            );
+            this.stageAuditEvent("turn_aborted", {
+              reason: "empty_response_retry_exhausted",
+              retries: this.emptyResponseRetry,
+              model: currentModel,
+            });
+            this.setStopReason("empty_response_retry_exhausted");
+            this.emitError("empty_response_retry_exhausted", err);
+            throw err;
           }
 
           // ── Guard 2: truncated response (text ends mid-sentence) ──
@@ -761,6 +814,12 @@ export class Turn {
     messages: LLMMessage[],
     toolDefs: ReadonlyArray<{ name: string }>,
   ): Promise<string> {
+    if (this.emptyResponseModelOverride) {
+      this.meta.configuredModel = await this.resolveRuntimeModel();
+      this.meta.effectiveModel = this.emptyResponseModelOverride;
+      this.meta.routeDecision = undefined;
+      return this.emptyResponseModelOverride;
+    }
     // Use dynamically resolved model (from api-proxy /v1/bot-model) if available,
     // falling back to pod env config.model. This ensures chat picker model changes
     // take effect without pod restart.

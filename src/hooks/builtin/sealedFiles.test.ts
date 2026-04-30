@@ -11,6 +11,7 @@ import os from "node:os";
 import path from "node:path";
 import {
   makeSealedFilesHooks,
+  allowSealedFileUpdateForTurn,
   globToRegExp,
   matchesAnyGlob,
   extractUnsealPatterns,
@@ -132,16 +133,20 @@ describe("resolveSealedPaths", () => {
 
   it("walks matching files, skips .spawn and manifest", async () => {
     await writeFileP(ws, "SOUL.md", "soul");
+    await writeFileP(ws, "LEARNING.md", "learning");
     await writeFileP(ws, "skills/a/SKILL.md", "a");
     await writeFileP(ws, "skills/b/SKILL.md", "b");
+    await writeFileP(ws, "skills-learned/a/SKILL.md", "learned");
     await writeFileP(ws, "memory/ROOT.md", "r");
     await writeFileP(ws, "unrelated.txt", "u");
     await writeFileP(ws, ".spawn/child/SOUL.md", "child");
     await writeFileP(ws, ".sealed-manifest.json", "{}");
     const paths = await resolveSealedPaths(ws, [...DEFAULT_SEALED_GLOBS]);
     expect(paths).toContain("SOUL.md");
+    expect(paths).toContain("LEARNING.md");
     expect(paths).toContain("skills/a/SKILL.md");
     expect(paths).toContain("skills/b/SKILL.md");
+    expect(paths).not.toContain("skills-learned/a/SKILL.md");
     expect(paths).toContain("memory/ROOT.md");
     expect(paths).not.toContain("unrelated.txt");
     expect(paths.some((p) => p.startsWith(".spawn/"))).toBe(false);
@@ -149,7 +154,7 @@ describe("resolveSealedPaths", () => {
 
   it("default sealed globs include runtime identity and tool contract files", () => {
     expect(DEFAULT_SEALED_GLOBS).toEqual(
-      expect.arrayContaining(["AGENTS.md", "TOOLS.md", "CLAUDE.md", "HEARTBEAT.md"]),
+      expect.arrayContaining(["AGENTS.md", "TOOLS.md", "CLAUDE.md", "HEARTBEAT.md", "LEARNING.md"]),
     );
   });
 });
@@ -593,6 +598,60 @@ describe("sealedFiles hook — integration", () => {
         retryCount: 0,
       },
       ctx3,
+    );
+    expect(again).toEqual({ action: "continue" });
+  });
+
+  it("allows a system-owned Hipocampus ROOT.md update during the turn", async () => {
+    await writeFileP(ws, "memory/ROOT.md", "root v1");
+    const hooks = makeSealedFilesHooks({ workspaceRoot: ws });
+    await hooks.beforeCommit.handler(
+      {
+        assistantText: "",
+        toolCallCount: 0,
+        toolReadHappened: false,
+        userMessage: "init",
+        retryCount: 0,
+      },
+      makeCtx("turn-init").ctx,
+    );
+
+    await writeFileP(ws, "memory/ROOT.md", "root v2 from compactor");
+    const { ctx, emitted } = makeCtx("turn-hipocampus");
+    allowSealedFileUpdateForTurn(ctx.turnId, "memory/ROOT.md");
+
+    const result = await hooks.beforeCommit.handler(
+      {
+        assistantText: "done",
+        toolCallCount: 0,
+        toolReadHappened: false,
+        userMessage: "hello",
+        retryCount: 0,
+      },
+      ctx,
+    );
+
+    expect(result).toEqual({ action: "continue" });
+    expect(
+      emitted.some(
+        (e) =>
+          e.type === "rule_check" &&
+          e.ruleId === "sealed-files" &&
+          e.verdict === "ok" &&
+          typeof e.detail === "string" &&
+          e.detail.includes("sealed_files_bypass kind=system"),
+      ),
+    ).toBe(true);
+    await hooks.afterCommit.handler({ assistantText: "done" }, ctx);
+    const again = await hooks.beforeCommit.handler(
+      {
+        assistantText: "next",
+        toolCallCount: 0,
+        toolReadHappened: false,
+        userMessage: "next",
+        retryCount: 0,
+      },
+      makeCtx("turn-next").ctx,
     );
     expect(again).toEqual({ action: "continue" });
   });

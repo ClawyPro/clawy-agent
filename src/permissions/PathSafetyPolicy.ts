@@ -21,6 +21,7 @@ const SEALED_FILES = new Set([
   "AGENTS.md",
   "CLAUDE.md",
   "HEARTBEAT.md",
+  "LEARNING.md",
 ]);
 
 const SECRET_PATTERNS = [
