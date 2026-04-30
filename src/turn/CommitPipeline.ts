@@ -19,7 +19,12 @@ import type { SseWriter } from "../transport/SseWriter.js";
 import type { LLMContentBlock } from "../transport/LLMClient.js";
 import type { HookContext } from "../hooks/types.js";
 import type { UserMessage, TokenUsage } from "../util/types.js";
+import type { AcceptanceCriterion } from "../execution/ExecutionContract.js";
 import { StructuredOutputContract, type StructuredOutputSpec } from "../structured/StructuredOutputContract.js";
+import {
+  classifyEvidence,
+  transcriptEvidenceForTurn,
+} from "../verification/VerificationEvidence.js";
 import type { RetryBlockKind } from "./RetryController.js";
 import type { TurnStopReason } from "./types.js";
 import { stripLeadingRouteMetaTag } from "./visibleText.js";
@@ -124,6 +129,7 @@ export async function commit(ctx: CommitPipelineContext): Promise<CommitResult> 
       typeof (b as { name?: string }).name === "string" &&
       /^(FileRead|Grep|Glob)$/.test((b as { name: string }).name),
   );
+  await recordExecutionContractEvidence(ctx);
   const preCommit = await ctx.session.agent.hooks.runPre(
     "beforeCommit",
     {
@@ -212,6 +218,81 @@ export async function commit(ctx: CommitPipelineContext): Promise<CommitResult> 
   );
 
   return { status: "committed", finalText };
+}
+
+async function recordExecutionContractEvidence(
+  ctx: CommitPipelineContext,
+): Promise<void> {
+  const contract = ctx.session.executionContract;
+  if (!contract) return;
+  try {
+    const transcript = await ctx.session.transcript.readAll();
+    const evidence = transcriptEvidenceForTurn(transcript, ctx.turnId);
+    const classified = classifyEvidence(evidence);
+    if (!classified.verification) return;
+    const criterionIds = inferCriterionIdsForVerification(
+      contract.snapshot().taskState.criteria,
+      classified.verificationCommands,
+    );
+    contract.recordVerificationEvidence({
+      source: "beforeCommit",
+      status: "passed",
+      command: classified.verificationCommands[0],
+      ...(criterionIds.length > 0 ? { criterionIds } : {}),
+      detail:
+        classified.verificationCommands.length > 0
+          ? classified.verificationCommands.join("; ")
+          : `verification tools: ${classified.tools.join(", ")}`,
+    });
+  } catch {
+    // Verification evidence is advisory state; existing commit gates
+    // still run against transcript directly and can block if needed.
+  }
+}
+
+function inferCriterionIdsForVerification(
+  criteria: AcceptanceCriterion[],
+  commands: string[],
+): string[] {
+  const pending = criteria.filter(
+    (criterion) =>
+      criterion.required &&
+      criterion.status !== "passed" &&
+      criterion.status !== "waived",
+  );
+  if (pending.length === 0) return [];
+  if (pending.length === 1) return [pending[0]!.id];
+
+  const commandText = commands.join("\n").toLowerCase();
+  if (!commandText) return [];
+  return pending
+    .filter((criterion) => criterionMatchesVerificationCommand(criterion.text, commandText))
+    .map((criterion) => criterion.id);
+}
+
+function criterionMatchesVerificationCommand(
+  criterionText: string,
+  commandText: string,
+): boolean {
+  const text = criterionText.toLowerCase();
+  const testCriterion = /(?:test|tests|테스트)/i.test(text);
+  const lintCriterion = /(?:lint|eslint|린트)/i.test(text);
+  const buildCriterion = /(?:build|빌드)/i.test(text);
+  const verifyCriterion = /(?:verify|verification|검증|확인)/i.test(text);
+
+  if (testCriterion && /\b(?:npm\s+(?:run\s+)?test|pnpm\s+test|yarn\s+test|bun\s+test|vitest|jest|pytest|go\s+test|cargo\s+test)\b/i.test(commandText)) {
+    return true;
+  }
+  if (lintCriterion && /\b(?:npm\s+(?:run\s+)?lint|pnpm\s+lint|yarn\s+lint|bun\s+lint|eslint|ruff|clippy)\b/i.test(commandText)) {
+    return true;
+  }
+  if (buildCriterion && /\b(?:npm\s+(?:run\s+)?build|pnpm\s+build|yarn\s+build|bun\s+build|tsc|cargo\s+build|go\s+build)\b/i.test(commandText)) {
+    return true;
+  }
+  if (verifyCriterion && /\b(?:test|lint|build|verify|check|qa|검증)\b/i.test(commandText)) {
+    return true;
+  }
+  return false;
 }
 
 async function appendCanonicalAssistantMessages(ctx: CommitPipelineContext): Promise<void> {

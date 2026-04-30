@@ -811,6 +811,8 @@ export function makeSpawnAgentTool(
           goal: snapshot.taskState.goal ?? input.prompt,
           constraints: snapshot.taskState.constraints,
           acceptanceCriteria: snapshot.taskState.acceptanceCriteria,
+          criteria: snapshot.taskState.criteria,
+          resourceBindings: snapshot.taskState.resourceBindings,
           allowedTools: expanded.allowedTools ?? [],
           childPrompt: input.prompt,
         });

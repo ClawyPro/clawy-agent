@@ -88,14 +88,88 @@ describe("executionContract verifier hook", () => {
 
     expect(blocked).toMatchObject({ action: "block" });
 
+    const criterionId = store.snapshot().taskState.criteria[0]!.id;
     store.recordVerificationEvidence({
       source: "beforeCommit",
       status: "passed",
+      criterionIds: [criterionId],
       detail: "npm test passed",
     });
     const allowed = await hook.handler(
       {
         assistantText: "완료했습니다. 테스트도 통과했습니다.",
+        toolCallCount: 1,
+        toolReadHappened: true,
+        userMessage: "작업해줘",
+        retryCount: 0,
+      },
+      ctxWithStore(store),
+    );
+
+    expect(allowed).toEqual({ action: "continue" });
+  });
+
+  it("blocks completion claims when any required criterion is unmet", async () => {
+    const store = new ExecutionContractStore({ now: () => 1 });
+    store.startTurn({
+      userMessage: [
+        "<task_contract>",
+        "<acceptance_criteria>",
+        "<item>tests pass</item>",
+        "<item>artifact delivered</item>",
+        "</acceptance_criteria>",
+        "</task_contract>",
+      ].join("\n"),
+    });
+    const firstId = store.snapshot().taskState.criteria[0]!.id;
+    store.recordVerificationEvidence({
+      source: "beforeCommit",
+      status: "passed",
+      command: "npm test",
+      criterionIds: [firstId],
+    });
+
+    const hook = makeExecutionContractVerifierHook();
+    const blocked = await hook.handler(
+      {
+        assistantText: "완료했습니다. 테스트도 통과했습니다.",
+        toolCallCount: 1,
+        toolReadHappened: true,
+        userMessage: "작업해줘",
+        retryCount: 0,
+      },
+      ctxWithStore(store),
+    );
+
+    expect(blocked).toMatchObject({ action: "block" });
+    expect(blocked && "reason" in blocked ? blocked.reason : "").toContain(
+      "artifact delivered",
+    );
+  });
+
+  it("allows completion when every required criterion is passed or waived", async () => {
+    const store = new ExecutionContractStore({ now: () => 1 });
+    store.startTurn({
+      userMessage:
+        "<task_contract><acceptance_criteria><item>tests pass</item><item>artifact delivered</item></acceptance_criteria></task_contract>",
+    });
+    const [first, second] = store.snapshot().taskState.criteria;
+    store.recordVerificationEvidence({
+      source: "beforeCommit",
+      status: "passed",
+      command: "npm test",
+      criterionIds: [first!.id],
+    });
+    store.markCriteria({
+      criterionIds: [second!.id],
+      status: "waived",
+      evidenceId: "manual-waiver",
+    });
+
+    const hook = makeExecutionContractVerifierHook();
+    const allowed = await hook.handler(
+      {
+        assistantText: "완료했습니다.",
         toolCallCount: 1,
         toolReadHappened: true,
         userMessage: "작업해줘",

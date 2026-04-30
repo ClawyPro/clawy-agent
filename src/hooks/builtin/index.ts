@@ -99,6 +99,10 @@ import {
   makeExecutionContractPromptHook,
   makeExecutionContractVerifierHook,
 } from "./executionContract.js";
+import {
+  makeResourceBoundaryHooks,
+  type ResourceBoundaryAgent,
+} from "./resourceBoundaryGate.js";
 import type { DebugWorkflow as DebugWorkflowType } from "../../debug/DebugWorkflow.js";
 import { makeDebugTurnClassifierHook } from "./debugTurnClassifier.js";
 import {
@@ -207,6 +211,12 @@ export interface RegisterBuiltinsOpts {
    * completion-evidence transcript reader shape.
    */
   artifactDeliveryAgent?: CompletionEvidenceAgent;
+  /**
+   * Delegate used by the resource-boundary gate to re-scan persisted
+   * current-turn tool calls at beforeCommit. This catches bypass-mode
+   * sessions where beforeToolUse hooks were intentionally skipped.
+   */
+  resourceBoundaryAgent?: ResourceBoundaryAgent;
   /**
    * Delegate used by the pre-refusal verifier hook (self-model Layer
    * 3) to read the session's on-disk transcript when checking whether
@@ -581,6 +591,15 @@ export function registerBuiltinHooks(
   if (maybe(executionContractVerifierHook.name)) {
     registry.register(executionContractVerifierHook);
     registered++;
+  }
+
+  const resourceBoundaryHooks = makeResourceBoundaryHooks({
+    agent: opts.resourceBoundaryAgent,
+  });
+  if (maybe(resourceBoundaryHooks.beforeToolUse.name)) {
+    registry.register(resourceBoundaryHooks.beforeToolUse);
+    registry.register(resourceBoundaryHooks.beforeCommit);
+    registered += 2;
   }
 
   const artifactDeliveryGateHook = makeArtifactDeliveryGateHook({

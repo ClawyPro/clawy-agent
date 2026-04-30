@@ -47,11 +47,135 @@ describe("ExecutionContractStore", () => {
 
     expect(store.snapshot().taskState.verificationEvidence).toEqual([
       {
+        evidenceId: "ev_1_co",
         source: "beforeCommit",
         command: "npm test",
         status: "passed",
         detail: "12 tests passed",
         recordedAt: 456,
+      },
+    ]);
+  });
+
+  it("tracks acceptance criteria as executable first-class state", () => {
+    const store = new ExecutionContractStore({ now: () => 1000 });
+
+    store.startTurn({
+      userMessage: [
+        "<task_contract>",
+        "<acceptance_criteria>",
+        "<item>unit tests pass</item>",
+        "<item>resource stays under reports/</item>",
+        "</acceptance_criteria>",
+        "<verification_mode>full</verification_mode>",
+        "</task_contract>",
+      ].join("\n"),
+    });
+
+    const criteria = store.snapshot().taskState.criteria;
+    expect(criteria).toHaveLength(2);
+    expect(criteria.map((c) => c.text)).toEqual([
+      "unit tests pass",
+      "resource stays under reports/",
+    ]);
+    expect(criteria.every((c) => c.status === "pending")).toBe(true);
+    expect(store.snapshot().taskState.acceptanceCriteria).toEqual([
+      "unit tests pass",
+      "resource stays under reports/",
+    ]);
+  });
+
+  it("marks linked criteria passed when verification evidence is recorded", () => {
+    const store = new ExecutionContractStore({ now: () => 1000 });
+    store.startTurn({
+      userMessage:
+        "<task_contract><acceptance_criteria><item>unit tests pass</item></acceptance_criteria></task_contract>",
+    });
+    const criterionId = store.snapshot().taskState.criteria[0]!.id;
+
+    store.recordVerificationEvidence({
+      source: "beforeCommit",
+      status: "passed",
+      command: "npm test",
+      criterionIds: [criterionId],
+      detail: "1 test passed",
+    });
+
+    expect(store.snapshot().taskState.criteria[0]).toMatchObject({
+      id: criterionId,
+      status: "passed",
+    });
+    expect(store.snapshot().taskState.criteria[0]!.evidenceIds).toHaveLength(1);
+  });
+
+  it("reports unmet required criteria separately from generic evidence", () => {
+    const store = new ExecutionContractStore({ now: () => 1000 });
+    store.startTurn({
+      userMessage: [
+        "<task_contract>",
+        "<acceptance_criteria>",
+        "<item>unit tests pass</item>",
+        "<item>artifact delivered</item>",
+        "</acceptance_criteria>",
+        "</task_contract>",
+      ].join("\n"),
+    });
+    const firstId = store.snapshot().taskState.criteria[0]!.id;
+
+    store.recordVerificationEvidence({
+      source: "beforeCommit",
+      status: "passed",
+      command: "npm test",
+      criterionIds: [firstId],
+      detail: "tests passed",
+    });
+
+    expect(store.unmetRequiredCriteria().map((c) => c.text)).toEqual([
+      "artifact delivered",
+    ]);
+  });
+
+  it("parses structured resource bindings from task_contract", () => {
+    const store = new ExecutionContractStore({ now: () => 1 });
+    store.startTurn({
+      userMessage: [
+        "<task_contract>",
+        "<resource_bindings mode=\"enforce\">",
+        "<allowed_workspace_paths><item>reports/</item><item>data/source.csv</item></allowed_workspace_paths>",
+        "<allowed_source_paths><item>kb://collection/source-a</item></allowed_source_paths>",
+        "<artifact_ids><item>artifact_123</item></artifact_ids>",
+        "<db_handles><item>primary_customer_db</item></db_handles>",
+        "</resource_bindings>",
+        "</task_contract>",
+      ].join("\n"),
+    });
+
+    expect(store.snapshot().taskState.resourceBindings).toEqual({
+      mode: "enforce",
+      allowedWorkspacePaths: ["reports/", "data/source.csv"],
+      allowedSourcePaths: ["kb://collection/source-a"],
+      artifactIds: ["artifact_123"],
+      resourceIds: [],
+      dbHandles: ["primary_customer_db"],
+    });
+  });
+
+  it("records used resource provenance on the contract", () => {
+    const store = new ExecutionContractStore({ now: () => 1 });
+    store.recordUsedResource({
+      kind: "workspace_path",
+      value: "reports/final.md",
+      toolName: "FileRead",
+      toolUseId: "tu_1",
+    });
+
+    expect(store.snapshot().taskState.usedResources).toEqual([
+      {
+        kind: "workspace_path",
+        value: "reports/final.md",
+        toolName: "FileRead",
+        toolUseId: "tu_1",
+        recordedAt: 1,
       },
     ]);
   });
@@ -84,6 +208,17 @@ describe("ExecutionContractStore", () => {
     });
   });
 
+  it("keeps explicit existing-file chat delivery turns on the light path", () => {
+    expect(
+      classifyExecutionControl(
+        "wsj_pipeline/WSJ_PIPELINE_HANDBOOK.md 이거 채팅으로 전달해줘",
+      ),
+    ).toEqual({
+      mode: "light",
+      reason: "deliver_existing_file",
+    });
+  });
+
   it("uses heavy control for state-changing document generation", () => {
     expect(classifyExecutionControl("리포트를 docx 파일로 만들어줘")).toEqual({
       mode: "heavy",
@@ -107,9 +242,11 @@ describe("completionClaimNeedsContractVerification", () => {
       ),
     ).toBe(true);
 
+    const criterionId = store.snapshot().taskState.criteria[0]!.id;
     store.recordVerificationEvidence({
       source: "beforeCommit",
       status: "passed",
+      criterionIds: [criterionId],
       detail: "npm test passed",
     });
 
@@ -162,5 +299,31 @@ describe("buildSpawnWorkOrderPrompt", () => {
     expect(prompt).toContain("파일 경로 보고");
     expect(prompt).toContain("문서 작성 부분을 맡아줘.");
     expect(prompt).toContain("Do not modify files outside your assigned scope");
+  });
+
+  it("includes structured criteria and resource bindings in child work orders", () => {
+    const store = new ExecutionContractStore({ now: () => 1 });
+    store.startTurn({
+      userMessage: [
+        "<task_contract>",
+        "<acceptance_criteria><item>tests pass</item></acceptance_criteria>",
+        "<resource_bindings mode=\"enforce\">",
+        "<allowed_workspace_paths><item>reports/</item></allowed_workspace_paths>",
+        "</resource_bindings>",
+        "</task_contract>",
+      ].join("\n"),
+    });
+
+    const prompt = buildSpawnWorkOrderPrompt({
+      parent: store.snapshot(),
+      childPrompt: "Review report generation.",
+      persona: "reviewer",
+      allowedTools: ["FileRead"],
+    });
+
+    expect(prompt).toContain("<resource_bindings mode=\"enforce\">");
+    expect(prompt).toContain("reports/");
+    expect(prompt).toContain("<item id=\"");
+    expect(prompt).toContain("tests pass");
   });
 });

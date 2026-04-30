@@ -809,6 +809,9 @@ export class Agent {
       artifactDeliveryAgent: {
         readSessionTranscript,
       },
+      resourceBoundaryAgent: {
+        readSessionTranscript,
+      },
       outputDeliveryAgent: {
         listUndelivered: async (sessionKey, turnId) => {
           const pending = await this.outputArtifacts.listUndelivered(sessionKey, turnId);

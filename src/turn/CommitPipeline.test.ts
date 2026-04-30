@@ -27,6 +27,7 @@ import { Transcript } from "../storage/Transcript.js";
 import { SseWriter } from "../transport/SseWriter.js";
 import type { HookContext } from "../hooks/types.js";
 import type { UserMessage } from "../util/types.js";
+import { ExecutionContractStore } from "../execution/ExecutionContract.js";
 
 class FakeSse extends SseWriter {
   readonly events: Array<Record<string, unknown>> = [];
@@ -54,6 +55,7 @@ async function makeCtx(opts: {
   blockBeforeCommit?: string;
   structuredOutputContract?: unknown;
   commitRetryCount?: number;
+  executionContract?: ExecutionContractStore;
 }): Promise<{
   ctx: CommitPipelineContext;
   sse: FakeSse;
@@ -97,6 +99,7 @@ async function makeCtx(opts: {
     meta: { sessionKey: "sess-key" },
     transcript,
     agent: agentStub,
+    executionContract: opts.executionContract,
     controlEvents: {
       append: async (event: unknown) => {
         controlEvents.push(event);
@@ -348,6 +351,42 @@ describe("CommitPipeline.commit", () => {
     const beforeCommit = hooks.find((h) => h.point === "beforeCommit");
     const args = beforeCommit?.args as { filesChanged?: string[] };
     expect(args.filesChanged).toEqual(["TOOLS.md"]);
+  });
+
+  it("links verification command evidence to the matching pending criterion before beforeCommit hooks", async () => {
+    const executionContract = new ExecutionContractStore({ now: () => 1 });
+    executionContract.startTurn({
+      userMessage:
+        "<task_contract><acceptance_criteria><item>tests pass</item></acceptance_criteria></task_contract>",
+    });
+    const { ctx, transcript } = await makeCtx({
+      blocks: [{ type: "text", text: "완료했습니다." }],
+      executionContract,
+    });
+    await transcript.append({
+      kind: "tool_call",
+      ts: 1,
+      turnId: "turn-1",
+      toolUseId: "tu-test",
+      name: "Bash",
+      input: { command: "npm test" },
+    });
+    await transcript.append({
+      kind: "tool_result",
+      ts: 2,
+      turnId: "turn-1",
+      toolUseId: "tu-test",
+      status: "ok",
+      output: "passed",
+      isError: false,
+    });
+
+    await commit(ctx);
+
+    expect(executionContract.snapshot().taskState.criteria[0]).toMatchObject({
+      text: "tests pass",
+      status: "passed",
+    });
   });
 });
 

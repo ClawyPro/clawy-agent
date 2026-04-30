@@ -328,16 +328,26 @@ describe("SpawnAgent — §7.12.d", () => {
     expect(typeof childPrompt).toBe("string");
     expect(childPrompt).toContain("<work_order>");
     expect(childPrompt).toContain("parent_goal: Ship OSS sync");
-    expect(childPrompt).toContain("<item>Focused tests pass</item>");
+    expect(childPrompt).toContain("<item id=");
+    expect(childPrompt).toContain("Focused tests pass</item>");
     expect(childPrompt).toContain("Do the child task");
-    expect(contract.snapshot().workOrders).toContainEqual({
-      persona: "child",
-      goal: "Ship OSS sync",
-      constraints: ["Do not touch unrelated files"],
-      acceptanceCriteria: ["Focused tests pass"],
-      allowedTools: ["Allowed"],
-      childPrompt: "Do the child task",
-    });
+    expect(contract.snapshot().workOrders).toContainEqual(
+      expect.objectContaining({
+        persona: "child",
+        goal: "Ship OSS sync",
+        constraints: ["Do not touch unrelated files"],
+        acceptanceCriteria: ["Focused tests pass"],
+        criteria: [
+          expect.objectContaining({
+            text: "Focused tests pass",
+            status: "pending",
+            required: true,
+          }),
+        ],
+        allowedTools: ["Allowed"],
+        childPrompt: "Do the child task",
+      }),
+    );
   });
 
   it("(c) deliver='return' returns child finalText and toolCallCount", async () => {

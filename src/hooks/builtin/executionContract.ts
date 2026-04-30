@@ -1,4 +1,5 @@
 import {
+  completionClaimMissingCriteria,
   completionClaimNeedsContractVerification,
   renderExecutionContractBlock,
   shouldInjectExecutionContract,
@@ -62,9 +63,15 @@ export function makeExecutionContractVerifierHook(): RegisteredHook<"beforeCommi
       if (!completionClaimNeedsContractVerification(snapshot, assistantText)) {
         return { action: "continue" };
       }
+      const missingCriteria = completionClaimMissingCriteria(snapshot, assistantText);
       if (retryCount >= MAX_RETRIES) {
         ctx.log("warn", "[execution-contract-verifier] retry exhausted; failing open", {
           acceptanceCriteria: snapshot.taskState.acceptanceCriteria,
+          missingCriteria: missingCriteria.map((criterion) => ({
+            id: criterion.id,
+            text: criterion.text,
+            status: criterion.status,
+          })),
         });
         return { action: "continue" };
       }
@@ -80,6 +87,16 @@ export function makeExecutionContractVerifierHook(): RegisteredHook<"beforeCommi
           "[RETRY:EXECUTION_CONTRACT_VERIFY] The active execution contract has acceptance criteria or full verification mode,",
           "but this completion claim has no recorded verification evidence.",
           "",
+          missingCriteria.length > 0
+            ? [
+                "Unmet acceptance criteria:",
+                ...missingCriteria.map(
+                  (criterion) =>
+                    `- ${criterion.id}: ${criterion.text} (${criterion.status})`,
+                ),
+                "",
+              ].join("\n")
+            : "",
           "Before finalising:",
           "1) Run or inspect the deterministic check that proves the acceptance criteria.",
           "2) Record the evidence by reporting the actual command/result or artifact inspection.",

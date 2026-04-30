@@ -1,17 +1,60 @@
 export type VerificationMode = "none" | "sample" | "full";
 export type ExecutionControlMode = "light" | "heavy";
+export type AcceptanceCriterionStatus = "pending" | "passed" | "failed" | "waived";
+export type ResourceBindingMode = "audit" | "enforce";
+export type UsedResourceKind =
+  | "workspace_path"
+  | "source_path"
+  | "artifact"
+  | "resource"
+  | "db_handle"
+  | "external_url";
 
 export interface ExecutionControlState {
   mode: ExecutionControlMode;
   reason: string;
 }
 
+export interface AcceptanceCriterion {
+  id: string;
+  text: string;
+  required: boolean;
+  status: AcceptanceCriterionStatus;
+  evidenceIds: string[];
+  updatedAt: number;
+}
+
+export interface ResourceBindings {
+  mode: ResourceBindingMode;
+  allowedWorkspacePaths: string[];
+  allowedSourcePaths: string[];
+  artifactIds: string[];
+  resourceIds: string[];
+  dbHandles: string[];
+}
+
+export interface UsedResourceRecord {
+  kind: UsedResourceKind;
+  value: string;
+  toolName: string;
+  toolUseId?: string;
+  recordedAt: number;
+}
+
 export interface VerificationEvidenceRecord {
+  evidenceId?: string;
   source: "beforeCommit" | "tool" | "hook" | "manual";
   status: "passed" | "failed" | "partial" | "unknown";
   recordedAt: number;
   command?: string;
   detail?: string;
+  criterionIds?: string[];
+  toolUseId?: string;
+  toolName?: string;
+  exitCode?: number | null;
+  assertions?: string[];
+  resourceIds?: string[];
+  artifactIds?: string[];
 }
 
 export interface ExecutionTaskState {
@@ -20,7 +63,11 @@ export interface ExecutionTaskState {
   currentPlan: string[];
   completedSteps: string[];
   blockers: string[];
+  criteria: AcceptanceCriterion[];
+  /** Compatibility view for existing prompt rendering and hooks. */
   acceptanceCriteria: string[];
+  resourceBindings: ResourceBindings;
+  usedResources: UsedResourceRecord[];
   verificationMode: VerificationMode;
   verificationEvidence: VerificationEvidenceRecord[];
   artifacts: string[];
@@ -32,6 +79,8 @@ export interface WorkOrder {
   goal: string;
   constraints: string[];
   acceptanceCriteria: string[];
+  criteria?: AcceptanceCriterion[];
+  resourceBindings?: ResourceBindings;
   allowedTools: string[];
   childPrompt: string;
 }
@@ -59,7 +108,7 @@ const HEAVY_ACTION_RE =
 const SIMPLE_FILE_UNDERSTANDING_RE =
   /(?:(?:파일|문서|파이프라인|pipeline|file|document).{0,40}(?:뭐|무엇|설명|알려|요약|읽어|분석|what|explain|summari[sz]e|read)|(?:뭐|무엇|설명|알려|요약|읽어|what|explain|summari[sz]e|read).{0,40}(?:파일|문서|파이프라인|pipeline|file|document))/i;
 const EXISTING_FILE_DELIVERY_RE =
-  /(?:(?:여기서|이거|기존|방금|that|this|existing).{0,30}(?:파일로|첨부|다운로드|보내|send|attach|download)|(?:파일로|첨부|다운로드|보내|send|attach|download).{0,30}(?:여기|이거|기존|방금|that|this|existing))/i;
+  /(?:(?:여기서|이거|기존|방금|that|this|existing).{0,30}(?:파일로|첨부|다운로드|보내|전달|채팅(?:으로)?|send|attach|download)|(?:파일로|첨부|다운로드|보내|전달|채팅(?:으로)?|send|attach|download).{0,30}(?:여기|이거|기존|방금|that|this|existing))/i;
 const CONTINUE_RE = /(?:continue|keep going|resume|finish|마저|계속|이어|끝까지|진행)/i;
 
 export class ExecutionContractStore {
@@ -75,7 +124,10 @@ export class ExecutionContractStore {
         currentPlan: [],
         completedSteps: [],
         blockers: [],
+        criteria: [],
         acceptanceCriteria: [],
+        resourceBindings: defaultResourceBindings(),
+        usedResources: [],
         verificationMode: "none",
         verificationEvidence: [],
         artifacts: [],
@@ -93,16 +145,28 @@ export class ExecutionContractStore {
     const parsed = parseTaskContract(input.userMessage);
     const goal = firstNonContractLine(input.userMessage);
     const control = classifyExecutionControl(input.userMessage, parsed, this.snapshotValue);
+    const acceptanceCriteria = mergeUnique(
+      this.snapshotValue.taskState.acceptanceCriteria,
+      parsed.acceptanceCriteria,
+    );
     this.patchTaskState({
       goal: parsed.goal ?? this.snapshotValue.taskState.goal ?? goal,
       constraints: mergeUnique(this.snapshotValue.taskState.constraints, parsed.constraints),
       currentPlan: mergeUnique(this.snapshotValue.taskState.currentPlan, parsed.currentPlan),
       completedSteps: mergeUnique(this.snapshotValue.taskState.completedSteps, parsed.completedSteps),
       blockers: mergeUnique(this.snapshotValue.taskState.blockers, parsed.blockers),
-      acceptanceCriteria: mergeUnique(
-        this.snapshotValue.taskState.acceptanceCriteria,
+      criteria: mergeCriteria(
+        this.snapshotValue.taskState.criteria,
         parsed.acceptanceCriteria,
+        this.now(),
       ),
+      acceptanceCriteria,
+      resourceBindings: parsed.resourceBindings
+        ? mergeResourceBindings(
+            this.snapshotValue.taskState.resourceBindings,
+            parsed.resourceBindings,
+          )
+        : this.snapshotValue.taskState.resourceBindings,
       artifacts: mergeUnique(this.snapshotValue.taskState.artifacts, parsed.artifacts),
       verificationMode: parsed.verificationMode ?? this.snapshotValue.taskState.verificationMode,
     });
@@ -126,12 +190,76 @@ export class ExecutionContractStore {
   recordVerificationEvidence(
     evidence: Omit<VerificationEvidenceRecord, "recordedAt">,
   ): void {
+    const now = this.now();
+    const evidenceId =
+      evidence.evidenceId ??
+      `ev_${this.snapshotValue.taskState.verificationEvidence.length + 1}_${now.toString(36)}`;
+    const record: VerificationEvidenceRecord = {
+      ...evidence,
+      evidenceId,
+      recordedAt: now,
+    };
+    const nextCriteria = evidence.criterionIds?.length
+      ? updateCriteriaStatus(
+          this.snapshotValue.taskState.criteria,
+          evidence.criterionIds,
+          evidence.status === "passed"
+            ? "passed"
+            : evidence.status === "failed"
+              ? "failed"
+              : "pending",
+          evidenceId,
+          now,
+        )
+      : this.snapshotValue.taskState.criteria;
     this.patchTaskState({
       verificationEvidence: [
         ...this.snapshotValue.taskState.verificationEvidence,
-        { ...evidence, recordedAt: this.now() },
+        record,
       ],
+      criteria: nextCriteria,
     });
+  }
+
+  markCriteria(input: {
+    criterionIds: string[];
+    status: AcceptanceCriterionStatus;
+    evidenceId?: string;
+  }): void {
+    if (input.criterionIds.length === 0) return;
+    this.patchTaskState({
+      criteria: updateCriteriaStatus(
+        this.snapshotValue.taskState.criteria,
+        input.criterionIds,
+        input.status,
+        input.evidenceId,
+        this.now(),
+      ),
+    });
+  }
+
+  recordUsedResource(input: Omit<UsedResourceRecord, "recordedAt">): void {
+    const existing = this.snapshotValue.taskState.usedResources;
+    const duplicate = existing.some(
+      (record) =>
+        record.kind === input.kind &&
+        record.value === input.value &&
+        record.toolName === input.toolName &&
+        record.toolUseId === input.toolUseId,
+    );
+    if (duplicate) return;
+    this.patchTaskState({
+      usedResources: [...existing, { ...input, recordedAt: this.now() }],
+    });
+  }
+
+  unmetRequiredCriteria(): AcceptanceCriterion[] {
+    return this.snapshotValue.taskState.criteria.filter(
+      (criterion) =>
+        criterion.required &&
+        criterion.status !== "passed" &&
+        criterion.status !== "waived",
+    );
   }
 
   recordWorkOrder(order: WorkOrder): void {
@@ -163,6 +291,7 @@ export function renderExecutionContractBlock(
     renderList("completed_steps", task.completedSteps),
     renderList("blockers", task.blockers),
     renderList("acceptance_criteria", task.acceptanceCriteria),
+    renderResourceBindingsBlock(task.resourceBindings),
     renderList(
       "verification_evidence",
       task.verificationEvidence.map((e) =>
@@ -181,11 +310,32 @@ export function completionClaimNeedsContractVerification(
 ): boolean {
   if (snapshot.control.mode !== "heavy") return false;
   const task = snapshot.taskState;
-  if (task.acceptanceCriteria.length === 0 && task.verificationMode !== "full") {
+  if (
+    task.criteria.length === 0 &&
+    task.acceptanceCriteria.length === 0 &&
+    task.verificationMode !== "full"
+  ) {
     return false;
   }
   if (!COMPLETION_CLAIM_RE.test(assistantText)) return false;
+  if (task.criteria.length > 0) {
+    return completionClaimMissingCriteria(snapshot, assistantText).length > 0;
+  }
   return !task.verificationEvidence.some((e) => e.status === "passed");
+}
+
+export function completionClaimMissingCriteria(
+  snapshot: ExecutionContractSnapshot,
+  assistantText: string,
+): AcceptanceCriterion[] {
+  if (snapshot.control.mode !== "heavy") return [];
+  if (!COMPLETION_CLAIM_RE.test(assistantText)) return [];
+  return snapshot.taskState.criteria.filter(
+    (criterion) =>
+      criterion.required &&
+      criterion.status !== "passed" &&
+      criterion.status !== "waived",
+  );
 }
 
 export function shouldInjectExecutionContract(
@@ -235,6 +385,8 @@ export function buildSpawnWorkOrderPrompt(input: {
     goal: task.goal ?? input.childPrompt,
     constraints: task.constraints,
     acceptanceCriteria: task.acceptanceCriteria,
+    criteria: task.criteria,
+    resourceBindings: task.resourceBindings,
     allowedTools: input.allowedTools ?? [],
     childPrompt: input.childPrompt,
   };
@@ -245,8 +397,14 @@ export function buildSpawnWorkOrderPrompt(input: {
     `parent_goal: ${order.goal}`,
     renderList("constraints", order.constraints),
     "<acceptance_criteria>",
-    ...order.acceptanceCriteria.map((value) => `<item>${value}</item>`),
+    ...(order.criteria && order.criteria.length > 0
+      ? order.criteria.map(
+          (criterion) =>
+            `<item id="${criterion.id}" status="${criterion.status}" required="${criterion.required}">${criterion.text}</item>`,
+        )
+      : order.acceptanceCriteria.map((value) => `<item>${value}</item>`)),
     "</acceptance_criteria>",
+    renderResourceBindingsXml(order.resourceBindings ?? defaultResourceBindings()),
     renderList("allowed_tools", order.allowedTools),
     "rules:",
     "- Do not modify files outside your assigned scope.",
@@ -284,7 +442,33 @@ function parseTaskContract(text: string): Partial<Omit<ExecutionTaskState, "upda
     if (tag === "blockers") out.blockers = values;
     if (tag === "artifacts") out.artifacts = values;
   }
+  const resourceBindings = parseResourceBindings(text);
+  if (resourceBindings) out.resourceBindings = resourceBindings;
   return out;
+}
+
+function parseResourceBindings(text: string): ResourceBindings | null {
+  const match = text.match(/<resource_bindings\b([^>]*)>([\s\S]*?)<\/resource_bindings>/i);
+  if (!match) return null;
+  const attrs = match[1] ?? "";
+  const body = match[2] ?? "";
+  const modeRaw = attrs.match(/\bmode\s*=\s*["']?(audit|enforce)["']?/i)?.[1];
+  const mode: ResourceBindingMode =
+    modeRaw?.toLowerCase() === "audit" ? "audit" : "enforce";
+  return {
+    mode,
+    allowedWorkspacePaths: extractTaggedItems(body, "allowed_workspace_paths"),
+    allowedSourcePaths: extractTaggedItems(body, "allowed_source_paths"),
+    artifactIds: extractTaggedItems(body, "artifact_ids"),
+    resourceIds: extractTaggedItems(body, "resource_ids"),
+    dbHandles: extractTaggedItems(body, "db_handles"),
+  };
+}
+
+function extractTaggedItems(raw: string, tag: string): string[] {
+  const match = raw.match(new RegExp(`<${tag}>\\s*([\\s\\S]*?)\\s*<\\/${tag}>`, "i"));
+  if (!match) return [];
+  return [...new Set(extractItems(match[1] ?? ""))];
 }
 
 function extractItems(raw: string): string[] {
@@ -316,6 +500,87 @@ function mergeUnique(existing: string[], next?: string[]): string[] {
   return [...new Set([...existing, ...next])];
 }
 
+function defaultResourceBindings(): ResourceBindings {
+  return {
+    mode: "audit",
+    allowedWorkspacePaths: [],
+    allowedSourcePaths: [],
+    artifactIds: [],
+    resourceIds: [],
+    dbHandles: [],
+  };
+}
+
+function mergeResourceBindings(
+  existing: ResourceBindings,
+  next: ResourceBindings,
+): ResourceBindings {
+  return {
+    mode: next.mode,
+    allowedWorkspacePaths: mergeUnique(existing.allowedWorkspacePaths, next.allowedWorkspacePaths),
+    allowedSourcePaths: mergeUnique(existing.allowedSourcePaths, next.allowedSourcePaths),
+    artifactIds: mergeUnique(existing.artifactIds, next.artifactIds),
+    resourceIds: mergeUnique(existing.resourceIds, next.resourceIds),
+    dbHandles: mergeUnique(existing.dbHandles, next.dbHandles),
+  };
+}
+
+function criterionIdForText(text: string): string {
+  let hash = 2166136261;
+  for (const ch of normalizeWhitespace(text)) {
+    hash ^= ch.charCodeAt(0);
+    hash = Math.imul(hash, 16777619);
+  }
+  return `ac_${(hash >>> 0).toString(36)}`;
+}
+
+function mergeCriteria(
+  existing: AcceptanceCriterion[],
+  nextTexts: string[] | undefined,
+  now: number,
+): AcceptanceCriterion[] {
+  if (!nextTexts || nextTexts.length === 0) return existing;
+  const byId = new Map(existing.map((criterion) => [criterion.id, criterion]));
+  for (const text of nextTexts) {
+    const normalized = normalizeWhitespace(text);
+    if (!normalized) continue;
+    const id = criterionIdForText(normalized);
+    if (byId.has(id)) continue;
+    byId.set(id, {
+      id,
+      text: normalized,
+      required: true,
+      status: "pending",
+      evidenceIds: [],
+      updatedAt: now,
+    });
+  }
+  return [...byId.values()];
+}
+
+function updateCriteriaStatus(
+  criteria: AcceptanceCriterion[],
+  criterionIds: string[],
+  status: AcceptanceCriterionStatus,
+  evidenceId: string | undefined,
+  now: number,
+): AcceptanceCriterion[] {
+  const ids = new Set(criterionIds);
+  return criteria.map((criterion) => {
+    if (!ids.has(criterion.id)) return criterion;
+    const evidenceIds =
+      evidenceId && !criterion.evidenceIds.includes(evidenceId)
+        ? [...criterion.evidenceIds, evidenceId]
+        : criterion.evidenceIds;
+    return {
+      ...criterion,
+      status,
+      evidenceIds,
+      updatedAt: now,
+    };
+  });
+}
+
 function hasActiveHeavyContract(snapshot?: ExecutionContractSnapshot): boolean {
   if (!snapshot) return false;
   return (
@@ -328,4 +593,49 @@ function hasActiveHeavyContract(snapshot?: ExecutionContractSnapshot): boolean {
 function renderList(label: string, values: string[]): string {
   if (values.length === 0) return `${label}: []`;
   return [`${label}:`, ...values.map((value) => `- ${value}`)].join("\n");
+}
+
+function renderResourceBindingsBlock(bindings: ResourceBindings): string {
+  if (!resourceBindingsAreActive(bindings)) return "resource_bindings: []";
+  return [
+    "resource_bindings:",
+    `- mode: ${bindings.mode}`,
+    ...bindings.allowedWorkspacePaths.map((value) => `- allowed_workspace_path: ${value}`),
+    ...bindings.allowedSourcePaths.map((value) => `- allowed_source_path: ${value}`),
+    ...bindings.artifactIds.map((value) => `- artifact_id: ${value}`),
+    ...bindings.resourceIds.map((value) => `- resource_id: ${value}`),
+    ...bindings.dbHandles.map((value) => `- db_handle: ${value}`),
+  ].join("\n");
+}
+
+function renderResourceBindingsXml(bindings: ResourceBindings): string {
+  if (!resourceBindingsAreActive(bindings)) return "<resource_bindings mode=\"audit\" />";
+  return [
+    `<resource_bindings mode="${bindings.mode}">`,
+    renderXmlItems("allowed_workspace_paths", bindings.allowedWorkspacePaths),
+    renderXmlItems("allowed_source_paths", bindings.allowedSourcePaths),
+    renderXmlItems("artifact_ids", bindings.artifactIds),
+    renderXmlItems("resource_ids", bindings.resourceIds),
+    renderXmlItems("db_handles", bindings.dbHandles),
+    "</resource_bindings>",
+  ].filter((line) => line.length > 0).join("\n");
+}
+
+function renderXmlItems(label: string, values: string[]): string {
+  if (values.length === 0) return "";
+  return [
+    `<${label}>`,
+    ...values.map((value) => `<item>${value}</item>`),
+    `</${label}>`,
+  ].join("\n");
+}
+
+function resourceBindingsAreActive(bindings: ResourceBindings): boolean {
+  return (
+    bindings.allowedWorkspacePaths.length > 0 ||
+    bindings.allowedSourcePaths.length > 0 ||
+    bindings.artifactIds.length > 0 ||
+    bindings.resourceIds.length > 0 ||
+    bindings.dbHandles.length > 0
+  );
 }
