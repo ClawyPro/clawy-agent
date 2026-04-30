@@ -78,14 +78,54 @@ NOT A CONTENT CLAIM (NO):
 Reply ONLY: YES or NO`;
 
 /**
- * LLM-based check: does the text make a content claim about a specific file?
+ * Check whether the text makes a content claim about a specific file.
+ * Deterministic patterns handle the common Korean/English cases; the
+ * optional LLM classifier is only a fallback for ambiguous phrasing.
  */
-export async function hasContentClaim(filename: string, text: string, ctx?: HookContext): Promise<boolean> {
+export function hasContentClaim(
+  filename: string,
+  text: string,
+  ctx?: HookContext,
+): boolean | Promise<boolean> {
   if (!text || !filename) return false;
   // Quick check: filename must appear in text
   if (!text.includes(filename) && !text.includes(filename.replace(/\.[^.]+$/, ""))) return false;
+  const deterministic = deterministicContentClaim(filename, text);
+  if (deterministic !== null) return deterministic;
   if (!ctx?.llm) return false;
 
+  return classifyContentClaimWithLlm(filename, text, ctx);
+}
+
+function deterministicContentClaim(filename: string, text: string): boolean | null {
+  const escaped = escapeRegExp(filename);
+  const stem = escapeRegExp(filename.replace(/\.[^.]+$/, ""));
+  const fileRef = `(?:${escaped}|${stem})`;
+  const claimRe = new RegExp(
+    [
+      `${fileRef}.{0,32}(?:에\\s*따르면|에\\s*의하면|에\\s*명시|내용(?:은|이)|포함|contains|states|says)`,
+      `(?:according\\s+to|as\\s+stated\\s+in|in)\\s+${fileRef}`,
+      `${fileRef}\\s+(?:contains|states|says|uses|defines|specifies)`,
+    ].join("|"),
+    "i",
+  );
+  if (claimRe.test(text)) return true;
+  const nonClaimRe = new RegExp(
+    [
+      `${fileRef}.{0,32}(?:확인해|열어|읽어|봐|check|read|open)`,
+      `(?:확인|열람|읽기|check|read|open).{0,32}${fileRef}`,
+    ].join("|"),
+    "i",
+  );
+  if (nonClaimRe.test(text)) return false;
+  return null;
+}
+
+async function classifyContentClaimWithLlm(
+  filename: string,
+  text: string,
+  ctx: HookContext,
+): Promise<boolean> {
   try {
     let result = "";
     for await (const event of ctx.llm.stream({
@@ -100,6 +140,10 @@ export async function hasContentClaim(filename: string, text: string, ctx?: Hook
   } catch {
     return false;
   }
+}
+
+function escapeRegExp(value: string): string {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
 
 const GENERIC_READ_CLAIM_PROMPT = `Does this text claim to have READ or CHECKED a file without naming which specific file?

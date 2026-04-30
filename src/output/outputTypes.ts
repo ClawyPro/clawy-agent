@@ -1,5 +1,21 @@
 export type OutputKind = "document" | "spreadsheet" | "file";
-export type OutputFormat = "html" | "docx" | "hwpx" | "pdf" | "xlsx" | "csv" | "tsv";
+export type OutputFormat =
+  | "html"
+  | "docx"
+  | "hwpx"
+  | "pdf"
+  | "xlsx"
+  | "csv"
+  | "tsv"
+  | "md"
+  | "txt"
+  | "json"
+  | "png"
+  | "jpg"
+  | "jpeg"
+  | "gif"
+  | "webp"
+  | "bin";
 export type PreviewKind = "inline-html" | "inline-markdown" | "download-only" | "none";
 export type DeliveryTarget = "chat" | "kb";
 export type DeliveryStatus = "pending" | "retrying" | "sent" | "failed";

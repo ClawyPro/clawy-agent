@@ -4,6 +4,7 @@
  */
 
 import type { TokenUsage } from "../util/types.js";
+import type { RouteDecision } from "../routing/types.js";
 
 export type TurnRoute = "direct" | "subagent" | "pipeline";
 
@@ -37,6 +38,9 @@ export interface TurnMeta {
   status: TurnStatus;
   usage: TokenUsage;
   stopReason?: TurnStopReason;
+  configuredModel?: string;
+  effectiveModel?: string;
+  routeDecision?: RouteDecision;
 }
 
 export interface PlanResult {

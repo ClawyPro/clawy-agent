@@ -408,6 +408,44 @@ describe("Turn.execute() stop-reason taxonomy", () => {
     expect(turn.getRecoveryAttempt()).toBe(0);
   });
 
+  it("replays assistant text before tool_use when model streams text after tool_use", async () => {
+    const { turn, llm } = await makeFixture(
+      [
+        {
+          blocks: [
+            {
+              type: "tool_use",
+              id: "tool_01",
+              name: "Echo",
+              input: { msg: "hi" },
+            },
+            { type: "text", text: "잠시만요." },
+          ],
+          stopReason: "tool_use",
+        },
+        { blocks: [{ type: "text", text: "done." }], stopReason: "end_turn" },
+      ],
+      { toolNames: ["Echo"] },
+    );
+
+    await turn.execute();
+
+    const assistantWithToolUse = llm.calls[1]?.messages.find(
+      (message) =>
+        message.role === "assistant" &&
+        Array.isArray(message.content) &&
+        message.content.some((block) => block.type === "tool_use"),
+    );
+    expect(assistantWithToolUse).toBeDefined();
+    if (!assistantWithToolUse || !Array.isArray(assistantWithToolUse.content)) {
+      return;
+    }
+    expect(assistantWithToolUse.content.map((block) => block.type)).toEqual([
+      "text",
+      "tool_use",
+    ]);
+  });
+
   it("max_tokens (1×) → recovery fires, second call concatenates", async () => {
     const { turn, llm, auditEvents } = await makeFixture([
       { blocks: [{ type: "text", text: "part-1 " }], stopReason: "max_tokens" },

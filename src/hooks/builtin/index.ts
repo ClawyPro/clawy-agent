@@ -95,6 +95,14 @@ import { makeTaskLifecycleHook } from "./taskLifecycle.js";
 import type { Discipline } from "../../Session.js";
 import type { PolicyKernel as PolicyKernelType } from "../../policy/PolicyKernel.js";
 import { makePolicyPromptBlockHook } from "./policyPromptBlock.js";
+import {
+  makeExecutionContractPromptHook,
+  makeExecutionContractVerifierHook,
+} from "./executionContract.js";
+import {
+  makeResourceBoundaryHooks,
+  type ResourceBoundaryAgent,
+} from "./resourceBoundaryGate.js";
 import type { DebugWorkflow as DebugWorkflowType } from "../../debug/DebugWorkflow.js";
 import { makeDebugTurnClassifierHook } from "./debugTurnClassifier.js";
 import {
@@ -204,6 +212,12 @@ export interface RegisterBuiltinsOpts {
    */
   artifactDeliveryAgent?: CompletionEvidenceAgent;
   /**
+   * Delegate used by the resource-boundary gate to re-scan persisted
+   * current-turn tool calls at beforeCommit. This catches bypass-mode
+   * sessions where beforeToolUse hooks were intentionally skipped.
+   */
+  resourceBoundaryAgent?: ResourceBoundaryAgent;
+  /**
    * Delegate used by the pre-refusal verifier hook (self-model Layer
    * 3) to read the session's on-disk transcript when checking whether
    * investigation tools fired this turn. Optional — when omitted the
@@ -275,6 +289,12 @@ export function registerBuiltinHooks(
   const reliabilityPromptHook = makeReliabilityPromptInjectorHook();
   if (maybe(reliabilityPromptHook.name)) {
     registry.register(reliabilityPromptHook);
+    registered++;
+  }
+
+  const executionContractPromptHook = makeExecutionContractPromptHook();
+  if (maybe(executionContractPromptHook.name)) {
+    registry.register(executionContractPromptHook);
     registered++;
   }
 
@@ -565,6 +585,21 @@ export function registerBuiltinHooks(
   if (maybe(taskContractGateHook.name)) {
     registry.register(taskContractGateHook);
     registered++;
+  }
+
+  const executionContractVerifierHook = makeExecutionContractVerifierHook();
+  if (maybe(executionContractVerifierHook.name)) {
+    registry.register(executionContractVerifierHook);
+    registered++;
+  }
+
+  const resourceBoundaryHooks = makeResourceBoundaryHooks({
+    agent: opts.resourceBoundaryAgent,
+  });
+  if (maybe(resourceBoundaryHooks.beforeToolUse.name)) {
+    registry.register(resourceBoundaryHooks.beforeToolUse);
+    registry.register(resourceBoundaryHooks.beforeCommit);
+    registered += 2;
   }
 
   const artifactDeliveryGateHook = makeArtifactDeliveryGateHook({

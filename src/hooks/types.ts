@@ -22,6 +22,7 @@ import type {
   AskUserQuestionOutput,
   ToolResult,
 } from "../Tool.js";
+import type { ExecutionContractStore } from "../execution/ExecutionContract.js";
 
 /**
  * Every hook point exposed by core-agent. Add new ones here as
@@ -105,6 +106,13 @@ export interface HookContext {
    * proxy response. Used by harness-level verification hooks; this is
    * not model self-assessment. */
   readonly providerHealth?: ProviderHealthContext | null;
+  /**
+   * First-class execution state for long-running work. Unlike the
+   * transcript, this keeps the current goal, constraints, plan,
+   * blockers, acceptance criteria, artifacts, and verification
+   * evidence as structured state that hooks can inspect deterministically.
+   */
+  readonly executionContract?: ExecutionContractStore;
   /**
    * Optional human-in-the-loop delegate. Populated by Turn.ts for
    * phases that can reasonably interact with the user (currently

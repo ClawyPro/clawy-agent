@@ -23,6 +23,7 @@ export function buildHookContext(
     turnId,
     llm: agent.llm,
     agentModel,
+    executionContract: session.executionContract,
     providerHealth: typeof agent.llm.getLastProviderHealth === "function"
       ? agent.llm.getLastProviderHealth()
       : null,

@@ -7,16 +7,47 @@ import { errorResult } from "../util/toolResult.js";
 import { markdownToStructuredBlocks, writeDocxFromBlocks, type StructuredBlock } from "./document/docxDriver.js";
 import { renderMarkdownToHtml } from "./document/htmlDriver.js";
 import { writeHwpxFromBlocks, type HwpxTemplate } from "./document/hwpxDriver.js";
+import { writePdfFromBlocks } from "./document/pdfDriver.js";
+import {
+  markdownToPlainText,
+  structuredBlocksToMarkdown,
+  structuredBlocksToPlainText,
+  writeTextFile,
+} from "./document/textDriver.js";
+
+type DocumentOutputFormat = "html" | "docx" | "hwpx" | "md" | "txt" | "pdf";
+type MarkdownSourceKind = "markdown" | "text" | "plain_text";
+type DocumentWriteSourceInput =
+  | string
+  | {
+      kind?: MarkdownSourceKind;
+      type?: MarkdownSourceKind;
+      content?: string;
+      markdown?: string;
+      text?: string;
+    }
+  | {
+      kind?: "structured";
+      type?: "structured";
+      blocks: StructuredBlock[];
+    };
+
+const SUPPORTED_FORMATS: readonly DocumentOutputFormat[] = [
+  "html",
+  "docx",
+  "hwpx",
+  "md",
+  "txt",
+  "pdf",
+];
 
 export interface DocumentWriteInput {
   mode: "create" | "edit";
-  format: "html" | "docx" | "hwpx";
+  format: DocumentOutputFormat;
   title: string;
   filename: string;
   template?: HwpxTemplate;
-  source:
-    | { kind: "markdown"; content: string }
-    | { kind: "structured"; blocks: StructuredBlock[] };
+  source: DocumentWriteSourceInput;
 }
 
 type NormalizedDocumentSource =
@@ -29,24 +60,120 @@ export interface DocumentWriteOutput {
   filename: string;
 }
 
+const STRUCTURED_BLOCK_SCHEMA = {
+  type: "object",
+  properties: {
+    type: { type: "string", enum: ["heading", "paragraph"] },
+    text: { type: "string" },
+    level: { type: "number", enum: [1, 2, 3] },
+  },
+  required: ["type", "text"],
+  additionalProperties: false,
+} as const;
+
+const SOURCE_SCHEMA = {
+  anyOf: [
+    {
+      type: "string",
+      description: "Markdown or plain text document content.",
+    },
+    {
+      type: "object",
+      properties: {
+        kind: { type: "string", enum: ["markdown", "text", "plain_text"] },
+        type: { type: "string", enum: ["markdown", "text", "plain_text"] },
+        content: { type: "string" },
+        markdown: { type: "string" },
+        text: { type: "string" },
+      },
+      anyOf: [
+        { required: ["content"] },
+        { required: ["markdown"] },
+        { required: ["text"] },
+      ],
+      additionalProperties: false,
+    },
+    {
+      type: "object",
+      properties: {
+        kind: { type: "string", enum: ["structured"] },
+        type: { type: "string", enum: ["structured"] },
+        blocks: {
+          type: "array",
+          items: STRUCTURED_BLOCK_SCHEMA,
+        },
+      },
+      required: ["blocks"],
+      additionalProperties: false,
+    },
+  ],
+} as const;
+
 const INPUT_SCHEMA = {
   type: "object",
   properties: {
     mode: { type: "string", enum: ["create", "edit"] },
-    format: { type: "string", enum: ["html", "docx", "hwpx"] },
+    format: { type: "string", enum: SUPPORTED_FORMATS },
     title: { type: "string" },
     filename: { type: "string" },
     template: { type: "string", enum: ["base", "gonmun", "report", "minutes"] },
-    source: { type: "object" },
+    source: SOURCE_SCHEMA,
   },
   required: ["mode", "format", "title", "filename", "source"],
+  additionalProperties: false,
 } as const;
 
 function basename(filePath: string): string {
   return filePath.split("/").pop() || filePath;
 }
 
-function normalizeSource(source: DocumentWriteInput["source"] | Record<string, unknown>): NormalizedDocumentSource {
+function isDocumentOutputFormat(format: unknown): format is DocumentOutputFormat {
+  return typeof format === "string" && SUPPORTED_FORMATS.includes(format as DocumentOutputFormat);
+}
+
+function mimeTypeFor(format: DocumentOutputFormat): string {
+  switch (format) {
+    case "html":
+      return "text/html";
+    case "docx":
+      return "application/vnd.openxmlformats-officedocument.wordprocessingml.document";
+    case "hwpx":
+      return "application/hwp+zip";
+    case "md":
+      return "text/markdown";
+    case "txt":
+      return "text/plain";
+    case "pdf":
+      return "application/pdf";
+  }
+}
+
+function previewKindFor(format: DocumentOutputFormat): "inline-html" | "inline-markdown" | "download-only" {
+  if (format === "html") return "inline-html";
+  if (format === "md") return "inline-markdown";
+  return "download-only";
+}
+
+function isMarkdownSourceKind(kind: string | undefined): kind is MarkdownSourceKind | undefined {
+  return kind === undefined || kind === "markdown" || kind === "text" || kind === "plain_text";
+}
+
+function firstStringField(raw: Record<string, unknown>, fields: readonly string[]): string | null {
+  for (const field of fields) {
+    const value = raw[field];
+    if (typeof value === "string") return value;
+  }
+  return null;
+}
+
+function normalizeSource(source: DocumentWriteInput["source"]): NormalizedDocumentSource {
+  if (typeof source === "string") {
+    return { kind: "markdown", content: source };
+  }
+  if (!source || typeof source !== "object" || Array.isArray(source)) {
+    throw new Error("source must be a markdown string or an object with content or blocks");
+  }
+
   const raw = source as Record<string, unknown>;
   const kind = typeof raw.kind === "string"
     ? raw.kind
@@ -54,11 +181,18 @@ function normalizeSource(source: DocumentWriteInput["source"] | Record<string, u
       ? raw.type
       : undefined;
 
-  if (kind === "markdown" && typeof raw.content === "string") {
-    return { kind, content: raw.content };
+  const content = firstStringField(raw, ["content", "markdown", "text"]);
+  if (content !== null && isMarkdownSourceKind(kind)) {
+    return { kind: "markdown", content };
   }
-  if (kind === "structured" && Array.isArray(raw.blocks)) {
-    return { kind, blocks: raw.blocks as StructuredBlock[] };
+  if ((kind === undefined || kind === "structured") && Array.isArray(raw.blocks)) {
+    return { kind: "structured", blocks: raw.blocks as StructuredBlock[] };
+  }
+  if (kind === "structured") {
+    throw new Error("source.blocks must be an array for structured source");
+  }
+  if (isMarkdownSourceKind(kind)) {
+    throw new Error("source.content must be a string for markdown source");
   }
   throw new Error(`unsupported source: ${kind ?? "undefined"}`);
 }
@@ -90,21 +224,27 @@ export function makeDocumentWriteTool(
   return {
     name: "DocumentWrite",
     description:
-      "Create or edit user-facing HTML and DOCX documents inside the bot workspace and register the result as an output artifact.",
+      "Create or edit user-facing md, txt, html, pdf, docx, and hwpx documents inside the bot workspace and register the result as an output artifact.",
     inputSchema: INPUT_SCHEMA,
     permission: "write",
     validate(input) {
       if (!input || (input.mode !== "create" && input.mode !== "edit")) {
         return "`mode` must be create or edit";
       }
-      if (input.format !== "html" && input.format !== "docx" && input.format !== "hwpx") {
-        return "`format` must be html, docx, or hwpx";
+      if (!isDocumentOutputFormat(input.format)) {
+        return "`format` must be md, txt, html, pdf, docx, or hwpx";
       }
       if (typeof input.title !== "string" || input.title.trim().length === 0) {
         return "`title` is required";
       }
       if (typeof input.filename !== "string" || input.filename.trim().length === 0) {
         return "`filename` is required";
+      }
+      try {
+        normalizeSource(input.source);
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        return `invalid source: ${message}`;
       }
       return null;
     },
@@ -122,6 +262,8 @@ export function makeDocumentWriteTool(
 
         if (input.format === "html" && source.kind === "markdown") {
           await fs.writeFile(absPath, renderMarkdownToHtml(source.content), "utf8");
+        } else if (input.format === "html" && source.kind === "structured") {
+          await fs.writeFile(absPath, renderMarkdownToHtml(structuredBlocksToMarkdown(source.blocks)), "utf8");
         } else if (input.format === "docx" && source.kind === "structured") {
           await writeDocxFromBlocks(absPath, source.blocks);
         } else if (input.format === "docx" && source.kind === "markdown") {
@@ -134,6 +276,18 @@ export function makeDocumentWriteTool(
             blocks: source.blocks,
             referencePath: referencePath ?? undefined,
           });
+        } else if (input.format === "md" && source.kind === "structured") {
+          await writeTextFile(absPath, structuredBlocksToMarkdown(source.blocks));
+        } else if (input.format === "md" && source.kind === "markdown") {
+          await writeTextFile(absPath, source.content);
+        } else if (input.format === "txt" && source.kind === "structured") {
+          await writeTextFile(absPath, structuredBlocksToPlainText(source.blocks));
+        } else if (input.format === "txt" && source.kind === "markdown") {
+          await writeTextFile(absPath, markdownToPlainText(source.content));
+        } else if (input.format === "pdf" && source.kind === "structured") {
+          await writePdfFromBlocks(absPath, input.title, source.blocks);
+        } else if (input.format === "pdf" && source.kind === "markdown") {
+          await writePdfFromBlocks(absPath, input.title, markdownToStructuredBlocks(source.content));
         } else {
           throw new Error(`unsupported combination: ${input.format}/${source.kind}`);
         }
@@ -145,14 +299,9 @@ export function makeDocumentWriteTool(
           format: input.format,
           title: input.title,
           filename: basename(input.filename),
-          mimeType:
-            input.format === "html"
-              ? "text/html"
-              : input.format === "docx"
-                ? "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
-                : "application/hwp+zip",
+          mimeType: mimeTypeFor(input.format),
           workspacePath: input.filename,
-          previewKind: input.format === "html" ? "inline-html" : "download-only",
+          previewKind: previewKindFor(input.format),
           createdByTool: "DocumentWrite",
           sourceKind: source.kind,
         });

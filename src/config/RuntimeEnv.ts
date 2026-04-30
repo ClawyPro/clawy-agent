@@ -5,7 +5,9 @@
  */
 
 import type { AgentConfig } from "../Agent.js";
+import type { PermissionMode } from "../Session.js";
 import { createProvider } from "../llm/createProvider.js";
+import { isRouterKeyword, type RoutingMode } from "../routing/types.js";
 
 function requireEnv(name: string): string {
   const v = process.env[name];
@@ -31,6 +33,69 @@ function parseIntSafe(name: string, fallback: number): number {
     return fallback;
   }
   return n;
+}
+
+function parsePermissionMode(raw: string | undefined): PermissionMode | undefined {
+  if (
+    raw === "default" ||
+    raw === "plan" ||
+    raw === "auto" ||
+    raw === "bypass"
+  ) {
+    return raw;
+  }
+  return undefined;
+}
+
+function parseRoutingMode(model: string): RoutingMode {
+  const explicit = optionalEnv("CORE_AGENT_ROUTING_MODE");
+  if (explicit === "off" || explicit === "hosted-proxy" || explicit === "direct") {
+    return explicit;
+  }
+  return isRouterKeyword(model) ? "hosted-proxy" : "off";
+}
+
+function directProvidersFromEnv(): AgentConfig["directProviders"] {
+  return {
+    ...(optionalEnv("ANTHROPIC_API_KEY")
+      ? {
+          anthropic: {
+            kind: "anthropic" as const,
+            baseUrl: optionalEnv("ANTHROPIC_BASE_URL") ?? "https://api.anthropic.com",
+            apiKey: optionalEnv("ANTHROPIC_API_KEY") ?? "",
+          },
+        }
+      : {}),
+    ...(optionalEnv("OPENAI_API_KEY")
+      ? {
+          openai: {
+            kind: "openai-compatible" as const,
+            baseUrl: optionalEnv("OPENAI_BASE_URL") ?? "https://api.openai.com",
+            apiKey: optionalEnv("OPENAI_API_KEY") ?? "",
+          },
+        }
+      : {}),
+    ...(optionalEnv("FIREWORKS_API_KEY")
+      ? {
+          fireworks: {
+            kind: "openai-compatible" as const,
+            baseUrl: optionalEnv("FIREWORKS_BASE_URL") ?? "https://api.fireworks.ai/inference",
+            apiKey: optionalEnv("FIREWORKS_API_KEY") ?? "",
+          },
+        }
+      : {}),
+    ...(optionalEnv("GOOGLE_API_KEY")
+      ? {
+          google: {
+            kind: "openai-compatible" as const,
+            baseUrl:
+              optionalEnv("GOOGLE_BASE_URL") ??
+              "https://generativelanguage.googleapis.com/v1beta/openai",
+            apiKey: optionalEnv("GOOGLE_API_KEY") ?? "",
+          },
+        }
+      : {}),
+  };
 }
 
 export interface RuntimeEnv {
@@ -117,6 +182,8 @@ export function loadFromConfig(config: ClawyAgentConfig): RuntimeEnv {
 /** Load RuntimeEnv from environment variables (Clawy Pro mode). */
 export function loadRuntimeEnv(): RuntimeEnv {
   const port = parseIntSafe("CORE_AGENT_PORT", 8080);
+  const model = optionalEnv("CORE_AGENT_MODEL") ?? "claude-opus-4-7";
+  const routingMode = parseRoutingMode(model);
 
   const agentConfig: AgentConfig = {
     botId: requireEnv("BOT_ID"),
@@ -124,10 +191,17 @@ export function loadRuntimeEnv(): RuntimeEnv {
     workspaceRoot:
       optionalEnv("CORE_AGENT_WORKSPACE") ?? "/home/ocuser/.openclaw/workspace",
     gatewayToken: requireEnv("GATEWAY_TOKEN"),
+    codexAccessToken: optionalEnv("CODEX_ACCESS_TOKEN"),
+    codexRefreshToken: optionalEnv("CODEX_REFRESH_TOKEN"),
     apiProxyUrl: requireEnv("CORE_AGENT_API_PROXY_URL"),
     chatProxyUrl: optionalEnv("CORE_AGENT_CHAT_PROXY_URL"),
     redisUrl: optionalEnv("CORE_AGENT_REDIS_URL"),
-    model: optionalEnv("CORE_AGENT_MODEL") ?? "claude-opus-4-6",
+    model,
+    defaultPermissionMode:
+      parsePermissionMode(optionalEnv("CORE_AGENT_PERMISSION_MODE")) ?? "bypass",
+    routingMode,
+    routingProfileId: optionalEnv("CORE_AGENT_ROUTING_PROFILE") ?? "standard",
+    directProviders: routingMode === "direct" ? directProvidersFromEnv() : undefined,
     telegramBotToken: optionalEnv("TELEGRAM_BOT_TOKEN"),
     discordBotToken: optionalEnv("DISCORD_BOT_TOKEN"),
     webAppPushEndpointUrl: optionalEnv("WEBAPP_PUSH_URL"),

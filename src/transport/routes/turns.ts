@@ -38,6 +38,10 @@ type ControlResponseInput = {
   updatedInput?: unknown;
   answer?: string;
 };
+type LegacyAskAnswer = {
+  selectedId?: string;
+  freeText?: string;
+};
 type ControlSession = {
   controlRequests?: unknown;
   controlEvents?: unknown;
@@ -423,6 +427,42 @@ function isControlDecision(value: unknown): value is ControlDecision {
   return value === "approved" || value === "denied" || value === "answered";
 }
 
+function legacyAskTurnId(requestId: string): string | null {
+  const marker = ":ask:";
+  const idx = requestId.indexOf(marker);
+  return idx > 0 ? requestId.slice(0, idx) : null;
+}
+
+function legacyAskAnswerFromPayload(
+  payload: Record<string, unknown>,
+): LegacyAskAnswer | null {
+  if (typeof payload.selectedId === "string" && payload.selectedId.length > 0) {
+    return { selectedId: payload.selectedId };
+  }
+  if (typeof payload.freeText === "string" && payload.freeText.trim().length > 0) {
+    return { freeText: payload.freeText.trim() };
+  }
+  if (typeof payload.answer === "string" && payload.answer.trim().length > 0) {
+    return { selectedId: payload.answer.trim() };
+  }
+  return null;
+}
+
+function resolveLegacyAskResponse(
+  ctx: HttpServerCtx,
+  requestId: string,
+  payload: Record<string, unknown>,
+): "not_legacy" | "empty_answer" | "not_pending" | "resolved" {
+  const turnId = legacyAskTurnId(requestId);
+  if (!turnId) return "not_legacy";
+  if (payload.decision !== "answered") return "empty_answer";
+  const answer = legacyAskAnswerFromPayload(payload);
+  if (!answer) return "empty_answer";
+  const turn = ctx.agent.getActiveTurn(turnId);
+  if (!turn) return "not_pending";
+  return turn.resolveAsk(requestId, answer) ? "resolved" : "not_pending";
+}
+
 function controlStoreOf(
   session: ControlSession,
 ): {
@@ -607,6 +647,19 @@ async function handleControlRequestResponse(
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
     if (/control request not found/.test(msg)) {
+      const legacy = resolveLegacyAskResponse(ctx, requestId, payload);
+      if (legacy === "resolved") {
+        writeJson(res, 200, { ok: true });
+        return;
+      }
+      if (legacy === "empty_answer") {
+        writeJson(res, 400, { error: "empty_answer" });
+        return;
+      }
+      if (legacy === "not_pending") {
+        writeJson(res, 404, { error: "question_not_pending" });
+        return;
+      }
       writeJson(res, 404, { error: "control_request_not_found" });
       return;
     }

@@ -38,6 +38,19 @@ afterEach(async () => {
 });
 
 describe("DocumentWrite", () => {
+  it("declares explicit source schema variants for upstream tool callers", async () => {
+    const root = await makeRoot();
+    const registry = new OutputArtifactRegistry(root);
+    const tool = makeDocumentWriteTool(root, registry);
+
+    const schema = JSON.stringify(tool.inputSchema);
+    expect(schema).toContain("\"source\"");
+    expect(schema).toContain("\"anyOf\"");
+    expect(schema).toContain("\"string\"");
+    expect(schema).toContain("\"content\"");
+    expect(schema).toContain("\"blocks\"");
+  });
+
   it("creates html from markdown and exposes inline preview", async () => {
     const root = await makeRoot();
     const registry = new OutputArtifactRegistry(root);
@@ -175,6 +188,50 @@ describe("DocumentWrite", () => {
     expect(bytes.subarray(0, 2).toString()).toBe("PK");
   });
 
+  it("accepts raw string source as markdown content", async () => {
+    const root = await makeRoot();
+    const registry = new OutputArtifactRegistry(root);
+    const tool = makeDocumentWriteTool(root, registry);
+
+    const result = await tool.execute(
+      {
+        mode: "create",
+        format: "md",
+        title: "String Source Memo",
+        filename: "exports/string-source.md",
+        source: "# String Source Memo\n\nGenerated from a direct source string.",
+      } as never,
+      ctx(root),
+    );
+
+    expect(result.status).toBe("ok");
+    const markdown = await fs.readFile(path.join(root, "exports", "string-source.md"), "utf8");
+    expect(markdown).toBe("# String Source Memo\n\nGenerated from a direct source string.\n");
+  });
+
+  it("infers markdown source from a content-only object", async () => {
+    const root = await makeRoot();
+    const registry = new OutputArtifactRegistry(root);
+    const tool = makeDocumentWriteTool(root, registry);
+
+    const result = await tool.execute(
+      {
+        mode: "create",
+        format: "pdf",
+        title: "Content Source Memo",
+        filename: "exports/content-source.pdf",
+        source: {
+          content: "# Content Source Memo\n\nGenerated without an explicit source kind.",
+        },
+      } as never,
+      ctx(root),
+    );
+
+    expect(result.status).toBe("ok");
+    const bytes = await fs.readFile(path.join(root, "exports", "content-source.pdf"));
+    expect(bytes.subarray(0, 5).toString()).toBe("%PDF-");
+  });
+
   it("creates hwpx from structured blocks and registers a downloadable artifact", async () => {
     const root = await makeRoot();
     const registry = new OutputArtifactRegistry(root);
@@ -207,6 +264,105 @@ describe("DocumentWrite", () => {
     expect(artifact).toMatchObject({
       format: "hwpx",
       filename: "weekly-minutes.hwpx",
+      previewKind: "download-only",
+    });
+  });
+
+  it("creates markdown from structured blocks and exposes inline markdown preview", async () => {
+    const root = await makeRoot();
+    const registry = new OutputArtifactRegistry(root);
+    const tool = makeDocumentWriteTool(root, registry);
+
+    const result = await tool.execute(
+      {
+        mode: "create",
+        format: "md",
+        title: "Investment Notes",
+        filename: "exports/investment-notes.md",
+        source: {
+          kind: "structured",
+          blocks: [
+            { type: "heading", level: 1, text: "Investment Notes" },
+            { type: "paragraph", text: "Revenue quality is improving." },
+          ],
+        },
+      } as never,
+      ctx(root),
+    );
+
+    expect(result.status).toBe("ok");
+    const markdown = await fs.readFile(path.join(root, "exports", "investment-notes.md"), "utf8");
+    expect(markdown).toBe("# Investment Notes\n\nRevenue quality is improving.\n");
+
+    const artifact = await registry.get(result.output!.artifactId);
+    expect(artifact).toMatchObject({
+      format: "md",
+      mimeType: "text/markdown",
+      filename: "investment-notes.md",
+      previewKind: "inline-markdown",
+    });
+  });
+
+  it("creates plain text from markdown source", async () => {
+    const root = await makeRoot();
+    const registry = new OutputArtifactRegistry(root);
+    const tool = makeDocumentWriteTool(root, registry);
+
+    const result = await tool.execute(
+      {
+        mode: "create",
+        format: "txt",
+        title: "Summary",
+        filename: "exports/summary.txt",
+        source: {
+          kind: "markdown",
+          content: "# Summary\n\n- First point\n- Second point",
+        },
+      } as never,
+      ctx(root),
+    );
+
+    expect(result.status).toBe("ok");
+    const text = await fs.readFile(path.join(root, "exports", "summary.txt"), "utf8");
+    expect(text).toBe("Summary\n\nFirst point\nSecond point\n");
+
+    const artifact = await registry.get(result.output!.artifactId);
+    expect(artifact).toMatchObject({
+      format: "txt",
+      mimeType: "text/plain",
+      filename: "summary.txt",
+      previewKind: "download-only",
+    });
+  });
+
+  it("creates pdf from markdown source and registers a downloadable artifact", async () => {
+    const root = await makeRoot();
+    const registry = new OutputArtifactRegistry(root);
+    const tool = makeDocumentWriteTool(root, registry);
+
+    const result = await tool.execute(
+      {
+        mode: "create",
+        format: "pdf",
+        title: "Investment Report",
+        filename: "exports/investment-report.pdf",
+        source: {
+          kind: "markdown",
+          content: "# Investment Report\n\n## Verdict\n\nStrong pass.",
+        },
+      } as never,
+      ctx(root),
+    );
+
+    expect(result.status).toBe("ok");
+    const bytes = await fs.readFile(path.join(root, "exports", "investment-report.pdf"));
+    expect(bytes.subarray(0, 5).toString()).toBe("%PDF-");
+
+    const artifact = await registry.get(result.output!.artifactId);
+    expect(artifact).toMatchObject({
+      format: "pdf",
+      mimeType: "application/pdf",
+      filename: "investment-report.pdf",
       previewKind: "download-only",
     });
   });
