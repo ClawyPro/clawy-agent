@@ -349,6 +349,8 @@ export class ContextEngine {
       "You compact a conversational transcript into a compact handoff",
       "summary for a successor assistant instance. Preserve:",
       "- Active task / goal.",
+      "- Preserve execution-contract state exactly when present:",
+      "  goal, constraints, current plan, completed steps, blockers, acceptance criteria, verification evidence, artifacts, and remaining risks.",
       "- Decisions already made.",
       "- Open questions / pending sub-tasks.",
       "- Files, ids, and numeric values the successor needs.",
@@ -599,27 +601,46 @@ function stripDanglingToolUses(messages: LLMMessage[]): LLMMessage[] {
     const msg = messages[i]!;
     if (msg.role !== "assistant" || !Array.isArray(msg.content)) continue;
 
-    const toolUseIds = new Set<string>();
-    for (const block of msg.content) {
-      if (block.type === "tool_use" && "id" in block) {
-        toolUseIds.add((block as { id: string }).id);
-      }
-    }
-    if (toolUseIds.size === 0) continue;
+    const toolUseIds: string[] = [];
+    const seenToolUseIds = new Set<string>();
+    msg.content = (msg.content as LLMContentBlock[]).filter((block) => {
+      if (block.type !== "tool_use" || !("id" in block)) return true;
+      const id = (block as { id: string }).id;
+      if (seenToolUseIds.has(id)) return false;
+      seenToolUseIds.add(id);
+      toolUseIds.push(id);
+      return true;
+    });
+    if (toolUseIds.length === 0) continue;
 
-    // Check if the next message has matching tool_results
+    // Check if the next message begins with matching tool_results.
+    // Anthropic rejects `[text, tool_result]` after an assistant
+    // `tool_use`: the tool_result blocks must be immediately after.
     const next = messages[i + 1];
     const matchedIds = new Set<string>();
     if (next && next.role === "user" && Array.isArray(next.content)) {
-      for (const block of next.content) {
-        if (block.type === "tool_result" && "tool_use_id" in block) {
-          matchedIds.add((block as { tool_use_id: string }).tool_use_id);
+      const nextBlocks = next.content as LLMContentBlock[];
+      const leadingResultsById = new Map<string, LLMContentBlock>();
+      let firstNonResult = 0;
+      for (const block of nextBlocks) {
+        if (block.type !== "tool_result") break;
+        if ("tool_use_id" in block) {
+          const id = (block as { tool_use_id: string }).tool_use_id;
+          if (!leadingResultsById.has(id)) leadingResultsById.set(id, block);
         }
+        firstNonResult += 1;
       }
+      const orderedResults = toolUseIds.flatMap((id) => {
+        const block = leadingResultsById.get(id);
+        if (!block) return [];
+        matchedIds.add(id);
+        return [block];
+      });
+      next.content = [...orderedResults, ...nextBlocks.slice(firstNonResult)];
     }
 
     // Remove unmatched tool_use blocks
-    const unmatched = [...toolUseIds].filter((id) => !matchedIds.has(id));
+    const unmatched = toolUseIds.filter((id) => !matchedIds.has(id));
     if (unmatched.length === 0) continue;
 
     const unmatchedSet = new Set(unmatched);
@@ -653,11 +674,22 @@ function stripDanglingToolUses(messages: LLMMessage[]): LLMMessage[] {
       }
     }
 
-    // Remove tool_result blocks that don't match any tool_use
+    // Remove tool_result blocks that don't match any tool_use, are not
+    // at the leading edge of the user message, or duplicate a prior
+    // historical result for the same tool_use id.
+    const seenResultIds = new Set<string>();
+    let stillLeading = true;
     msg.content = (msg.content as LLMContentBlock[]).filter((block) => {
-      if (block.type !== "tool_result") return true;
+      if (block.type !== "tool_result") {
+        stillLeading = false;
+        return true;
+      }
+      if (!stillLeading) return false;
       const id = (block as { tool_use_id: string }).tool_use_id;
-      return prevToolIds.has(id);
+      if (!prevToolIds.has(id)) return false;
+      if (seenResultIds.has(id)) return false;
+      seenResultIds.add(id);
+      return true;
     });
 
     // If user message is now empty, remove it
@@ -712,16 +744,10 @@ function canonicalContentBlocks(content: unknown[]): LLMContentBlock[] {
       blocks.push({ type: "text", text: obj.text });
       continue;
     }
-    if (
-      obj.type === "thinking" &&
-      typeof obj.thinking === "string" &&
-      typeof obj.signature === "string"
-    ) {
-      blocks.push({
-        type: "thinking",
-        thinking: obj.thinking,
-        signature: obj.signature,
-      });
+    if (obj.type === "thinking" || obj.type === "redacted_thinking") {
+      // Stored thinking signatures can become invalid when replayed
+      // from old transcripts. Live in-turn replay preserves signed
+      // thinking separately; historical replay does not need it.
       continue;
     }
     if (

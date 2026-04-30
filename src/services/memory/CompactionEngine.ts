@@ -303,15 +303,17 @@ export class CompactionEngine {
     const monthlyUpdated = await this.compactMonthly(result);
 
     // Always regenerate ROOT.md when any monthly content exists
+    let rootUpdated = false;
     if (dailyUpdated || weeklyUpdated || monthlyUpdated) {
       await this.compactRoot();
+      rootUpdated = true;
     } else {
       // Even with no updates, regenerate root if monthly files exist
       // but root doesn't (e.g. first run after partial compaction)
-      await this.compactRootIfNeeded();
+      rootUpdated = await this.compactRootIfNeeded();
     }
 
-    result.compacted = dailyUpdated || weeklyUpdated || monthlyUpdated;
+    result.compacted = dailyUpdated || weeklyUpdated || monthlyUpdated || rootUpdated;
 
     // Update state
     if (result.compacted) {
@@ -522,13 +524,15 @@ export class CompactionEngine {
   // ─── Root: monthly/ → ROOT.md ───
 
   /** Regenerate ROOT.md only if monthly content exists but ROOT.md doesn't. */
-  private async compactRootIfNeeded(): Promise<void> {
+  private async compactRootIfNeeded(): Promise<boolean> {
     const rootPath = join(this.memoryDir, "ROOT.md");
-    if (await fileExists(rootPath)) return;
+    if (await fileExists(rootPath)) return false;
     const files = await listDir(this.monthlyDir);
     if (files.some(f => MONTH_RE.test(f))) {
       await this.compactRoot();
+      return true;
     }
+    return false;
   }
 
   private async compactRoot(): Promise<void> {
@@ -592,7 +596,12 @@ export class CompactionEngine {
    */
   private async safeSummarize(content: string, instruction: string, fallback: string): Promise<string> {
     try {
-      return await this.summarize(content, instruction);
+      const summary = await this.summarize(content, instruction);
+      if (summary.trim().length === 0) {
+        console.warn("[compaction] LLM summarize returned empty output, using raw fallback");
+        return fallback;
+      }
+      return summary;
     } catch (err) {
       console.warn(`[compaction] LLM summarize failed, using raw fallback: ${(err as Error).message}`);
       return fallback;

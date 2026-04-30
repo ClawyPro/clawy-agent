@@ -513,6 +513,7 @@ describe("chain gate relaxation", () => {
 
     const rootContent = await readFile(join(memDir, "ROOT.md"), "utf8");
     expect(rootContent).toContain("Fresh root from monthly");
+    expect(result.compacted).toBe(true);
   });
 
   it("wraps generated ROOT.md with canonical Hipocampus frontmatter and sections", async () => {
@@ -735,6 +736,38 @@ describe("LLM summarization", () => {
 
     const dailyContent = await readFile(join(memDir, "daily", "2026-04-10.md"), "utf8");
     expect(dailyContent).toContain("Line 1: some content here");
+  });
+
+  it("falls back to source content when LLM returns an empty summary", async () => {
+    const memDir = join(tmpDir, "memory");
+    await mkdir(memDir, { recursive: true });
+    await writeFile(join(memDir, "2026-04-10.md"), generateLines(250));
+
+    const emptyLLM = createMockLLM("");
+    const engine = new CompactionEngine(tmpDir, defaultConfig(), emptyLLM);
+    const result = await engine.run(true);
+
+    expect(result.stats.daily).toContain("2026-04-10");
+    const dailyContent = await readFile(join(memDir, "daily", "2026-04-10.md"), "utf8");
+    expect(dailyContent).toContain("Line 1: some content here");
+  });
+
+  it("does not write an empty ROOT.md when the root summarizer returns empty text", async () => {
+    const memDir = join(tmpDir, "memory");
+    const monthlyDir = join(memDir, "monthly");
+    await mkdir(monthlyDir, { recursive: true });
+    await writeFile(
+      join(monthlyDir, "2026-04.md"),
+      "---\ntype: monthly\nstatus: tentative\nperiod: 2026-04\n---\n\nApril operational memory",
+    );
+
+    const emptyLLM = createMockLLM("");
+    const engine = new CompactionEngine(tmpDir, defaultConfig(), emptyLLM);
+    await engine.run(true);
+
+    const rootContent = await readFile(join(memDir, "ROOT.md"), "utf8");
+    expect(rootContent).toContain("April operational memory");
+    expect(rootContent.length).toBeGreaterThan(200);
   });
 
   it("allows slow summarization calls that exceed 30 seconds", async () => {

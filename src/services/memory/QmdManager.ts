@@ -152,20 +152,23 @@ export class QmdManager {
   }
 
   private async exec(args: string[]): Promise<{ stdout: string; stderr: string }> {
-    // Try local node_modules first, then global
-    const localBin = path.join(this.workspaceRoot, "node_modules", ".bin", "qmd");
-    try {
-      return await execFileAsync(localBin, args, {
-        cwd: this.workspaceRoot,
-        timeout: 30_000,
-      });
-    } catch {
-      // Fall back to global qmd
-      return execFileAsync("qmd", args, {
-        cwd: this.workspaceRoot,
-        timeout: 30_000,
-      });
+    const candidates = [
+      path.join(this.workspaceRoot, "node_modules", ".bin", "qmd"),
+      path.join(process.cwd(), "node_modules", ".bin", "qmd"),
+      "qmd",
+    ];
+    let lastError: unknown = null;
+    for (const bin of candidates) {
+      try {
+        return await execFileAsync(bin, args, {
+          cwd: this.workspaceRoot,
+          timeout: 30_000,
+        });
+      } catch (err) {
+        lastError = err;
+      }
     }
+    throw lastError instanceof Error ? lastError : new Error("qmd command failed");
   }
 
   private async withReadSlot<T>(fn: () => Promise<T>): Promise<T> {
