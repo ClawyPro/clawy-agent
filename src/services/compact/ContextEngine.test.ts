@@ -113,6 +113,21 @@ function committedEntry(turnId: string, ts = 9_000): TranscriptEntry {
   return { kind: "turn_committed", ts, turnId, inputTokens: 100, outputTokens: 50 };
 }
 
+function canonicalAssistantEntry(
+  turnId: string,
+  content: unknown[],
+  ts = 3_000,
+): TranscriptEntry {
+  return {
+    kind: "canonical_message",
+    ts,
+    turnId,
+    messageId: `${turnId}:assistant:1`,
+    role: "assistant",
+    content,
+  };
+}
+
 function boundaryEntry(
   boundaryId: string,
   summaryText: string,
@@ -180,7 +195,8 @@ describe("ContextEngine.buildMessagesFromTranscript", () => {
     expect(messages).toHaveLength(3);
     expect(messages[1]?.role).toBe("assistant");
     const assistantBlocks = messages[1]?.content as Array<{ type: string; text?: string }>;
-    expect(assistantBlocks.map((block) => block.type)).toEqual(["thinking", "text", "tool_use"]);
+    expect(assistantBlocks.map((block) => block.type)).toEqual(["text", "tool_use"]);
+    expect(JSON.stringify(assistantBlocks)).not.toContain("private reasoning");
     expect(JSON.stringify(assistantBlocks)).not.toContain("legacy duplicate text");
     expect(messages[2]?.role).toBe("user");
   });
@@ -285,6 +301,8 @@ describe("ContextEngine.maybeCompact", () => {
     });
     expect(transcript.appended[1]).toBe(boundary);
     expect(calls.length).toBe(1);
+    expect(calls[0]!.system).toContain("Preserve execution-contract state");
+    expect(calls[0]!.system).toContain("goal, constraints, current plan, completed steps, blockers, acceptance criteria");
   });
 
   it("fails open (returns null, no boundary) when Haiku errors out", async () => {
@@ -585,6 +603,34 @@ describe("ContextEngine.buildMessagesFromTranscript — tool blocks", () => {
     expect(resultBlocks.filter((b) => b.type === "tool_result").length).toBe(2);
   });
 
+  it("orders replayed tool_results to match the assistant tool_use order", () => {
+    const { client } = mockLLM(() => []);
+    const engine = new ContextEngine(client);
+
+    const entries: TranscriptEntry[] = [
+      userEntry("t1", "collect both facts", 1_000),
+      toolCallEntry("t1", "tu_bash", "Bash", { command: "kb-search" }, 2_000),
+      toolCallEntry("t1", "tu_artifact", "ArtifactList", { kind: "report" }, 2_001),
+      // Parallel tools persist transcript results in completion order,
+      // which can differ from the assistant's tool_use order.
+      toolResultEntry("t1", "tu_artifact", "artifact list", 3_000),
+      toolResultEntry("t1", "tu_bash", "search output", 3_001),
+      { kind: "turn_aborted", ts: 4_000, turnId: "t1", reason: "upstream 400" },
+      userEntry("t2", "continue", 5_000),
+    ];
+
+    const messages = engine.buildMessagesFromTranscript(entries);
+    const assistant = messages.find((message) => message.role === "assistant");
+    const user = messages[messages.findIndex((message) => message === assistant) + 1];
+    const assistantBlocks = assistant?.content as Array<{ type: string; id?: string }>;
+    const resultBlocks = user?.content as Array<{ type: string; tool_use_id?: string }>;
+
+    expect(assistantBlocks.filter((block) => block.type === "tool_use").map((block) => block.id))
+      .toEqual(["tu_bash", "tu_artifact"]);
+    expect(resultBlocks.filter((block) => block.type === "tool_result").map((block) => block.tool_use_id))
+      .toEqual(["tu_bash", "tu_artifact"]);
+  });
+
   it("maintains strict user/assistant alternation across multiple turns", () => {
     const { client } = mockLLM(() => []);
     const engine = new ContextEngine(client);
@@ -745,5 +791,70 @@ describe("ContextEngine.buildMessagesFromTranscript — tool blocks", () => {
     }
     expect(hasToolUse).toBe(true);
     expect(hasToolResult).toBe(true);
+  });
+
+  it("strips tool_use when matching tool_result was merged after user text", () => {
+    const { client } = mockLLM(() => []);
+    const engine = new ContextEngine(client);
+
+    const entries: TranscriptEntry[] = [
+      canonicalAssistantEntry("t1", [
+        { type: "text", text: "Checking task output." },
+        {
+          type: "tool_use",
+          id: "functions.TaskOutput:0",
+          name: "TaskOutput",
+          input: { taskId: "spawn_1" },
+        },
+      ]),
+      // A later interrupted turn can merge the user's text before a
+      // same-id tool_result. That result is not "immediately after" the
+      // tool_use and must not keep the historical tool_use alive.
+      userEntry("t2", "어캐됐어", 4_000),
+      toolResultEntry("t2", "functions.TaskOutput:0", "late result", 4_001),
+    ];
+
+    const messages = engine.buildMessagesFromTranscript(entries);
+    const assistant = messages.find((msg) => msg.role === "assistant");
+    expect(assistant).toBeDefined();
+    expect(Array.isArray(assistant?.content)).toBe(true);
+    expect((assistant?.content as Array<{ type: string }>).some(
+      (block) => block.type === "tool_use",
+    )).toBe(false);
+
+    const last = messages[messages.length - 1]!;
+    expect(last.role).toBe("user");
+    expect(Array.isArray(last.content)).toBe(true);
+    const userBlocks = last.content as Array<{ type: string; text?: string }>;
+    expect(userBlocks.map((block) => block.type)).toEqual(["text"]);
+    expect(userBlocks[0]?.text).toContain("어캐됐어");
+  });
+
+  it("deduplicates repeated tool_results for the same tool_use id", () => {
+    const { client } = mockLLM(() => []);
+    const engine = new ContextEngine(client);
+
+    const entries: TranscriptEntry[] = [
+      canonicalAssistantEntry("t1", [
+        { type: "text", text: "Running shell." },
+        {
+          type: "tool_use",
+          id: "functions_Bash_1",
+          name: "Bash",
+          input: { command: "pwd" },
+        },
+      ]),
+      toolResultEntry("t1", "functions_Bash_1", "/workspace", 4_000),
+      toolResultEntry("t1", "functions_Bash_1", "/workspace duplicate", 4_001),
+    ];
+
+    const messages = engine.buildMessagesFromTranscript(entries);
+    const user = messages.find((msg) => msg.role === "user");
+    expect(user).toBeDefined();
+    expect(Array.isArray(user?.content)).toBe(true);
+    const resultBlocks = (user?.content as Array<{ type: string; tool_use_id?: string }>)
+      .filter((block) => block.type === "tool_result");
+    expect(resultBlocks).toHaveLength(1);
+    expect(resultBlocks[0]?.tool_use_id).toBe("functions_Bash_1");
   });
 });

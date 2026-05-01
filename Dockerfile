@@ -51,7 +51,7 @@ USER ocuser
 ENV NODE_ENV=production \
     CORE_AGENT_PORT=8080 \
     CORE_AGENT_WORKSPACE=/home/ocuser/.clawy/workspace \
-    PATH=/home/ocuser/.clawy/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+    PATH=/home/ocuser/.clawy/bin:/app/node_modules/.bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 
 EXPOSE 8080
 

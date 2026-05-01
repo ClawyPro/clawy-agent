@@ -152,6 +152,34 @@ describe("QmdManager", () => {
 
       expect(mgr.isReady()).toBe(false);
     });
+
+    it("tries the bundled app qmd binary before falling back to global qmd", async () => {
+      const cwdSpy = vi.spyOn(process, "cwd").mockReturnValue("/app");
+      let callCount = 0;
+      mockExecFile.mockImplementation(
+        ((_bin: unknown, _args: unknown, _opts: unknown, cb: unknown) => {
+          callCount++;
+          if (callCount === 1) {
+            (cb as (err: Error) => void)(new Error("workspace qmd missing"));
+            return;
+          }
+          (cb as (err: null, result: { stdout: string; stderr: string }) => void)(
+            null,
+            { stdout: "", stderr: "" },
+          );
+        }) as typeof execFile,
+      );
+
+      try {
+        const mgr = new QmdManager(WORKSPACE, false);
+        await mgr.start();
+      } finally {
+        cwdSpy.mockRestore();
+      }
+
+      const bins = mockExecFile.mock.calls.map((c) => c[0]);
+      expect(bins).toContain(path.join("/app", "node_modules", ".bin", "qmd"));
+    });
   });
 
   describe("search()", () => {
