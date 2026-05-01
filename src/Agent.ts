@@ -79,6 +79,7 @@ import { makeArtifactListTool } from "./tools/ArtifactList.js";
 import { makeArtifactUpdateTool } from "./tools/ArtifactUpdate.js";
 import { makeArtifactDeleteTool } from "./tools/ArtifactDelete.js";
 import { makeDocumentWriteTool } from "./tools/DocumentWrite.js";
+import { makeBrowserTool } from "./tools/Browser.js";
 import { makeFileDeliverTool } from "./tools/FileDeliver.js";
 import { makeFileSendTool } from "./tools/FileSend.js";
 import { makeSpreadsheetWriteTool } from "./tools/SpreadsheetWrite.js";
@@ -459,6 +460,7 @@ export class Agent {
     this.tools.register(makeArtifactUpdateTool(this.artifacts));
     this.tools.register(makeArtifactDeleteTool(this.artifacts));
     this.tools.register(makeDocumentWriteTool(config.workspaceRoot, this.outputArtifacts));
+    this.tools.register(makeBrowserTool(config.workspaceRoot));
     this.tools.register(makeSpreadsheetWriteTool(config.workspaceRoot, this.outputArtifacts));
     this.tools.register(
       makeFileSendTool({
@@ -875,6 +877,9 @@ export class Agent {
       console.log(
         `[core-agent] skills: loaded=${n} issues=${issues} runtimeHooks=${runtimeHooks} from ${skillsDir}`,
       );
+      // Keep native browser deterministic even when a workspace ships a
+      // prompt-only skill with the same name.
+      this.tools.replace(makeBrowserTool(this.config.workspaceRoot));
     } catch (err) {
       console.warn(`[core-agent] skill load failed: ${(err as Error).message}`);
     }

@@ -1,0 +1,360 @@
+import fs from "node:fs/promises";
+import os from "node:os";
+import path from "node:path";
+import { afterEach, describe, expect, it } from "vitest";
+import type { ToolContext } from "../Tool.js";
+import { makeBrowserTool, type BrowserRunner } from "./Browser.js";
+
+const roots: string[] = [];
+
+async function makeRoot(): Promise<string> {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "browser-tool-"));
+  roots.push(root);
+  return root;
+}
+
+function makeCtx(root: string, sessionKey = "session-1"): ToolContext {
+  return {
+    botId: "bot-1",
+    sessionKey,
+    turnId: "turn-1",
+    workspaceRoot: root,
+    askUser: async () => ({ selectedId: "ok" }),
+    emitProgress: () => {},
+    abortSignal: AbortSignal.timeout(5_000),
+    staging: {
+      stageFileWrite: () => {},
+      stageTranscriptAppend: () => {},
+      stageAuditEvent: () => {},
+    },
+  };
+}
+
+afterEach(async () => {
+  await Promise.all(
+    roots.splice(0).map((root) => fs.rm(root, { recursive: true, force: true })),
+  );
+});
+
+describe("Browser", () => {
+  it("creates a browser session and reuses its cdp endpoint for open and snapshot", async () => {
+    const root = await makeRoot();
+    const calls: Array<{ command: string; args: string[] }> = [];
+    const runner: BrowserRunner = async (command, args) => {
+      calls.push({ command, args });
+      if (command === "integration.sh") {
+        return {
+          exitCode: 0,
+          signal: null,
+          stdout: JSON.stringify({
+            sessionId: "sess-1",
+            cdpEndpoint: "ws://browser-worker:9222/devtools?token=t",
+          }),
+          stderr: "",
+          truncated: false,
+        };
+      }
+      return {
+        exitCode: 0,
+        signal: null,
+        stdout: "ok",
+        stderr: "",
+        truncated: false,
+      };
+    };
+    const tool = makeBrowserTool(root, { runner });
+    const ctx = makeCtx(root);
+
+    const create = await tool.execute({ action: "create_session" }, ctx);
+    const open = await tool.execute({ action: "open", url: "https://example.com" }, ctx);
+    const snapshot = await tool.execute({ action: "snapshot" }, ctx);
+
+    expect(create.status).toBe("ok");
+    expect(open.status).toBe("ok");
+    expect(snapshot.status).toBe("ok");
+    expect(calls).toEqual([
+      { command: "integration.sh", args: ["browser/session-create"] },
+      {
+        command: "agent-browser",
+        args: [
+          "--cdp",
+          "ws://browser-worker:9222/devtools?token=t",
+          "open",
+          "https://example.com",
+        ],
+      },
+      {
+        command: "agent-browser",
+        args: ["--cdp", "ws://browser-worker:9222/devtools?token=t", "snapshot"],
+      },
+    ]);
+  });
+
+  it("rejects invalid browser URLs before running agent-browser", async () => {
+    const root = await makeRoot();
+    const calls: Array<{ command: string; args: string[] }> = [];
+    const runner: BrowserRunner = async (command, args) => {
+      calls.push({ command, args });
+      return {
+        exitCode: 0,
+        signal: null,
+        stdout: JSON.stringify({
+          sessionId: "sess-1",
+          cdpEndpoint: "ws://browser-worker:9222/devtools?token=t",
+        }),
+        stderr: "",
+        truncated: false,
+      };
+    };
+    const tool = makeBrowserTool(root, { runner });
+    const ctx = makeCtx(root);
+
+    await tool.execute({ action: "create_session" }, ctx);
+    const result = await tool.execute({ action: "open", url: "javascript:alert(1)" }, ctx);
+
+    expect(result.status).toBe("error");
+    expect(result.errorCode).toBe("invalid_url");
+    expect(calls).toEqual([{ command: "integration.sh", args: ["browser/session-create"] }]);
+  });
+
+  it("requires an active session for browser commands", async () => {
+    const root = await makeRoot();
+    const tool = makeBrowserTool(root, {
+      runner: async () => {
+        throw new Error("runner should not be called");
+      },
+    });
+
+    const result = await tool.execute({ action: "snapshot" }, makeCtx(root));
+
+    expect(result.status).toBe("error");
+    expect(result.errorCode).toBe("no_active_session");
+  });
+
+  it("runs scrape, click, fill, scroll, and screenshot with safe argument arrays", async () => {
+    const root = await makeRoot();
+    const calls: Array<{ command: string; args: string[] }> = [];
+    const runner: BrowserRunner = async (command, args) => {
+      calls.push({ command, args });
+      if (command === "integration.sh") {
+        return {
+          exitCode: 0,
+          signal: null,
+          stdout: JSON.stringify({
+            sessionId: "sess-1",
+            cdpEndpoint: "ws://browser-worker:9222/devtools?token=t",
+          }),
+          stderr: "",
+          truncated: false,
+        };
+      }
+      return { exitCode: 0, signal: null, stdout: "ok", stderr: "", truncated: false };
+    };
+    const tool = makeBrowserTool(root, { runner });
+    const ctx = makeCtx(root);
+
+    await tool.execute({ action: "create_session" }, ctx);
+    await tool.execute({ action: "scrape" }, ctx);
+    await tool.execute({ action: "click", selector: "@e1" }, ctx);
+    await tool.execute({ action: "fill", selector: "@e2", text: "hello world" }, ctx);
+    await tool.execute({ action: "scroll", direction: "down" }, ctx);
+    await tool.execute({ action: "screenshot", path: "screens/page.png" }, ctx);
+
+    expect(calls).toEqual([
+      { command: "integration.sh", args: ["browser/session-create"] },
+      { command: "agent-browser", args: ["--cdp", "ws://browser-worker:9222/devtools?token=t", "scrape"] },
+      { command: "agent-browser", args: ["--cdp", "ws://browser-worker:9222/devtools?token=t", "click", "@e1"] },
+      {
+        command: "agent-browser",
+        args: ["--cdp", "ws://browser-worker:9222/devtools?token=t", "fill", "@e2", "hello world"],
+      },
+      { command: "agent-browser", args: ["--cdp", "ws://browser-worker:9222/devtools?token=t", "scroll", "down"] },
+      {
+        command: "agent-browser",
+        args: [
+          "--cdp",
+          "ws://browser-worker:9222/devtools?token=t",
+          "screenshot",
+          path.join(root, "screens/page.png"),
+        ],
+      },
+    ]);
+  });
+
+  it("uses longer default timeouts for slow browser actions and clamps overrides", async () => {
+    const root = await makeRoot();
+    const timeouts: Array<{ command: string; action: string; timeoutMs: number }> = [];
+    const runner: BrowserRunner = async (command, args, _ctx, timeoutMs) => {
+      timeouts.push({ command, action: args[0] ?? "", timeoutMs });
+      if (command === "integration.sh") {
+        return {
+          exitCode: 0,
+          signal: null,
+          stdout: JSON.stringify({
+            sessionId: "sess-1",
+            cdpEndpoint: "ws://browser-worker:9222/devtools?token=t",
+          }),
+          stderr: "",
+          truncated: false,
+        };
+      }
+      return { exitCode: 0, signal: null, stdout: "ok", stderr: "", truncated: false };
+    };
+    const tool = makeBrowserTool(root, { runner });
+    const ctx = makeCtx(root);
+
+    await tool.execute({ action: "create_session" }, ctx);
+    await tool.execute({ action: "open", url: "https://example.com" }, ctx);
+    await tool.execute({ action: "scrape" }, ctx);
+    await tool.execute({ action: "screenshot", path: "screens/page.png" }, ctx);
+    await tool.execute({ action: "snapshot", timeoutMs: 999_999 }, ctx);
+
+    expect(timeouts).toEqual([
+      { command: "integration.sh", action: "browser/session-create", timeoutMs: 30_000 },
+      { command: "agent-browser", action: "--cdp", timeoutMs: 60_000 },
+      { command: "agent-browser", action: "--cdp", timeoutMs: 60_000 },
+      { command: "agent-browser", action: "--cdp", timeoutMs: 60_000 },
+      { command: "agent-browser", action: "--cdp", timeoutMs: 120_000 },
+    ]);
+  });
+
+  it("rejects screenshot paths that escape the workspace", async () => {
+    const root = await makeRoot();
+    const runner: BrowserRunner = async (command) => {
+      if (command === "integration.sh") {
+        return {
+          exitCode: 0,
+          signal: null,
+          stdout: JSON.stringify({
+            sessionId: "sess-1",
+            cdpEndpoint: "ws://browser-worker:9222/devtools?token=t",
+          }),
+          stderr: "",
+          truncated: false,
+        };
+      }
+      throw new Error("agent-browser should not be called");
+    };
+    const tool = makeBrowserTool(root, { runner });
+    const ctx = makeCtx(root);
+
+    await tool.execute({ action: "create_session" }, ctx);
+    const result = await tool.execute({ action: "screenshot", path: "../escape.png" }, ctx);
+
+    expect(result.status).toBe("error");
+    expect(result.errorCode).toBe("invalid_path");
+  });
+
+  it("closes a browser session and clears local session state", async () => {
+    const root = await makeRoot();
+    const calls: Array<{ command: string; args: string[] }> = [];
+    const runner: BrowserRunner = async (command, args) => {
+      calls.push({ command, args });
+      if (command === "integration.sh" && args[0] === "browser/session-create") {
+        return {
+          exitCode: 0,
+          signal: null,
+          stdout: JSON.stringify({
+            sessionId: "sess-1",
+            cdpEndpoint: "ws://browser-worker:9222/devtools?token=t",
+          }),
+          stderr: "",
+          truncated: false,
+        };
+      }
+      return { exitCode: 0, signal: null, stdout: "closed", stderr: "", truncated: false };
+    };
+    const tool = makeBrowserTool(root, { runner });
+    const ctx = makeCtx(root);
+
+    await tool.execute({ action: "create_session" }, ctx);
+    const close = await tool.execute({ action: "close_session" }, ctx);
+    const snapshot = await tool.execute({ action: "snapshot" }, ctx);
+
+    expect(close.status).toBe("ok");
+    expect(snapshot.status).toBe("error");
+    expect(snapshot.errorCode).toBe("no_active_session");
+    expect(calls).toEqual([
+      { command: "integration.sh", args: ["browser/session-create"] },
+      { command: "integration.sh", args: ["browser/session-close?sessionId=sess-1"] },
+    ]);
+  });
+
+  it("keeps local session state when close fails so it can be retried", async () => {
+    const root = await makeRoot();
+    const calls: Array<{ command: string; args: string[] }> = [];
+    const runner: BrowserRunner = async (command, args) => {
+      calls.push({ command, args });
+      if (command === "integration.sh" && args[0] === "browser/session-create") {
+        return {
+          exitCode: 0,
+          signal: null,
+          stdout: JSON.stringify({
+            sessionId: "sess-1",
+            cdpEndpoint: "ws://browser-worker:9222/devtools?token=t",
+          }),
+          stderr: "",
+          truncated: false,
+        };
+      }
+      if (command === "integration.sh") {
+        return { exitCode: 1, signal: null, stdout: "", stderr: "close failed", truncated: false };
+      }
+      return { exitCode: 0, signal: null, stdout: "snapshot ok", stderr: "", truncated: false };
+    };
+    const tool = makeBrowserTool(root, { runner });
+    const ctx = makeCtx(root);
+
+    await tool.execute({ action: "create_session" }, ctx);
+    const close = await tool.execute({ action: "close_session" }, ctx);
+    const snapshot = await tool.execute({ action: "snapshot" }, ctx);
+
+    expect(close.status).toBe("error");
+    expect(close.errorCode).toBe("command_failed");
+    expect(snapshot.status).toBe("ok");
+    expect(calls).toEqual([
+      { command: "integration.sh", args: ["browser/session-create"] },
+      { command: "integration.sh", args: ["browser/session-close?sessionId=sess-1"] },
+      {
+        command: "agent-browser",
+        args: ["--cdp", "ws://browser-worker:9222/devtools?token=t", "snapshot"],
+      },
+    ]);
+  });
+
+  it("closes an existing remote session before replacing it", async () => {
+    const root = await makeRoot();
+    const calls: Array<{ command: string; args: string[] }> = [];
+    let createCount = 0;
+    const runner: BrowserRunner = async (command, args) => {
+      calls.push({ command, args });
+      if (command === "integration.sh" && args[0] === "browser/session-create") {
+        createCount += 1;
+        return {
+          exitCode: 0,
+          signal: null,
+          stdout: JSON.stringify({
+            sessionId: `sess-${createCount}`,
+            cdpEndpoint: `ws://browser-worker:9222/devtools?token=t${createCount}`,
+          }),
+          stderr: "",
+          truncated: false,
+        };
+      }
+      return { exitCode: 0, signal: null, stdout: "closed", stderr: "", truncated: false };
+    };
+    const tool = makeBrowserTool(root, { runner });
+    const ctx = makeCtx(root);
+
+    await tool.execute({ action: "create_session" }, ctx);
+    const replaced = await tool.execute({ action: "create_session", replaceExisting: true }, ctx);
+
+    expect(replaced.status).toBe("ok");
+    expect(replaced.output?.sessionId).toBe("sess-2");
+    expect(calls).toEqual([
+      { command: "integration.sh", args: ["browser/session-create"] },
+      { command: "integration.sh", args: ["browser/session-close?sessionId=sess-1"] },
+      { command: "integration.sh", args: ["browser/session-create"] },
+    ]);
+  });
+});
