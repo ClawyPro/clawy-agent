@@ -459,7 +459,15 @@ export class Agent {
     this.tools.register(makeArtifactListTool(this.artifacts));
     this.tools.register(makeArtifactUpdateTool(this.artifacts));
     this.tools.register(makeArtifactDeleteTool(this.artifacts));
-    this.tools.register(makeDocumentWriteTool(config.workspaceRoot, this.outputArtifacts));
+    this.tools.register(
+      makeDocumentWriteTool(config.workspaceRoot, this.outputArtifacts, {
+        agentic: {
+          llm: this.llm,
+          resolveModel: () => this.resolveRuntimeModel(),
+          fallbackModel: config.model,
+        },
+      }),
+    );
     this.tools.register(makeBrowserTool(config.workspaceRoot));
     this.tools.register(makeSpreadsheetWriteTool(config.workspaceRoot, this.outputArtifacts));
     this.tools.register(

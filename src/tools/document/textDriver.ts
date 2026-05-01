@@ -7,15 +7,13 @@ function ensureTrailingNewline(value: string): string {
 }
 
 export function structuredBlocksToMarkdown(blocks: StructuredBlock[]): string {
-  const parts = blocks
-    .map((block) => {
-      if (block.type === "heading") {
-        const level = Math.max(1, Math.min(block.level ?? 1, 3));
-        return `${"#".repeat(level)} ${block.text.trim()}`;
-      }
-      return block.text.trim();
-    })
-    .filter(Boolean);
+  const parts = blocks.map((block) => {
+    if (block.type === "heading") {
+      const level = Math.max(1, Math.min(block.level ?? 1, 3));
+      return `${"#".repeat(level)} ${block.text.trim()}`;
+    }
+    return block.text.trim();
+  }).filter(Boolean);
 
   return ensureTrailingNewline(parts.join("\n\n"));
 }

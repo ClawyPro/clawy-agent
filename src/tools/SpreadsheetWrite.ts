@@ -1,6 +1,7 @@
 import fs from "node:fs/promises";
 import path from "node:path";
 import ExcelJS from "exceljs";
+import { resolveGeneratedOutputPath } from "../output/generatedOutputPath.js";
 import type { OutputArtifactRegistry } from "../output/OutputArtifactRegistry.js";
 import type { Tool, ToolContext, ToolResult } from "../Tool.js";
 import { errorResult } from "../util/toolResult.js";
@@ -92,10 +93,6 @@ const INPUT_SCHEMA = {
   additionalProperties: false,
 } as const;
 
-function basename(filePath: string): string {
-  return filePath.split("/").pop() || filePath;
-}
-
 function toCellValue(value: SpreadsheetCellValue): ExcelJS.CellValue {
   return value as ExcelJS.CellValue;
 }
@@ -145,7 +142,8 @@ export function makeSpreadsheetWriteTool(
       const start = Date.now();
       try {
         const workbook = new ExcelJS.Workbook();
-        const absPath = path.join(workspaceRoot, input.filename);
+        const outputPath = resolveGeneratedOutputPath(input.filename);
+        const absPath = path.join(workspaceRoot, outputPath.workspacePath);
         await fs.mkdir(path.dirname(absPath), { recursive: true });
 
         if (input.mode === "edit") {
@@ -168,9 +166,9 @@ export function makeSpreadsheetWriteTool(
           kind: "spreadsheet",
           format: "xlsx",
           title: input.title,
-          filename: basename(input.filename),
+          filename: outputPath.filename,
           mimeType: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-          workspacePath: input.filename,
+          workspacePath: outputPath.workspacePath,
           previewKind: "none",
           createdByTool: "SpreadsheetWrite",
           sourceKind: input.mode,
@@ -180,8 +178,8 @@ export function makeSpreadsheetWriteTool(
           status: "ok",
           output: {
             artifactId: artifact.artifactId,
-            workspacePath: input.filename,
-            filename: basename(input.filename),
+            workspacePath: outputPath.workspacePath,
+            filename: outputPath.filename,
           },
           durationMs: Date.now() - start,
         };
