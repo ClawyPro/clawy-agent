@@ -62,6 +62,21 @@ NO examples: "explain this code", "코드 분석해줘", "what does this do", "s
 
 Reply ONLY: YES or NO`;
 
+const DOCUMENT_OR_FILE_OUTPUT_RE =
+  /\b(?:docx|pdf|md|markdown|hwpx|hwp|pptx|xlsx|csv|document|file|report)\b|(?:마크다운|문서|파일|보고서|리포트|첨부|전달)/i;
+const DOCUMENT_OR_FILE_ACTION_RE =
+  /(?:만들|작성|생성|변환|내보내|내뱉|보내|전달|첨부|deliver|attach|export|convert|render|write|generate|create)/i;
+const CODE_IMPLEMENTATION_TARGET_RE =
+  /\b(?:api|endpoint|route|handler|hook|service|component|module|function|class|middleware|schema|migration|database|frontend|backend)\b|(?:구현|코드|엔드포인트|라우트|핸들러|서비스|컴포넌트|모듈|함수|마이그레이션|프론트|백엔드)/i;
+
+function isDocumentOrFileOperation(text: string): boolean {
+  return (
+    DOCUMENT_OR_FILE_OUTPUT_RE.test(text) &&
+    DOCUMENT_OR_FILE_ACTION_RE.test(text) &&
+    !CODE_IMPLEMENTATION_TARGET_RE.test(text)
+  );
+}
+
 export async function matchesImplementationIntent(text: string, ctx?: HookContext): Promise<boolean> {
   if (!text) return false;
   if (!ctx?.llm) return false;
@@ -129,6 +144,7 @@ export function makePlanModeAutoTriggerHook(
 
         const text = latestUserText(args.messages);
         if (!text) return { action: "continue" };
+        if (isDocumentOrFileOperation(text)) return { action: "continue" };
         if (!(await matchesImplementationIntent(text, ctx))) return { action: "continue" };
 
         ctx.log("info", "[plan-mode-auto-trigger] nudging toward /plan", {

@@ -5,7 +5,6 @@
 
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import {
-  IMPLEMENTATION_INTENT_RE,
   isAutoTriggerEnabled,
   makePlanModeAutoTriggerHook,
   matchesImplementationIntent,
@@ -15,13 +14,21 @@ import type { HookContext } from "../types.js";
 import type { LLMMessage } from "../../transport/LLMClient.js";
 import type { PermissionMode } from "../../Session.js";
 
-function makeCtx(sessionKey = "s1"): HookContext {
+function llmThatAnswers(answer: string): HookContext["llm"] {
+  return {
+    stream: vi.fn(async function* () {
+      yield { kind: "text_delta" as const, delta: answer };
+    }),
+  } as unknown as HookContext["llm"];
+}
+
+function makeCtx(sessionKey = "s1", classifierAnswer = "NO"): HookContext {
   return {
     botId: "bot-test",
     userId: "user-test",
     sessionKey,
     turnId: "turn-1",
-    llm: {} as never,
+    llm: llmThatAnswers(classifierAnswer),
     transcript: [],
     emit: vi.fn(),
     log: vi.fn(),
@@ -58,25 +65,35 @@ function agentWith(mode: PermissionMode | null): PlanModeAutoTriggerAgent {
   };
 }
 
-describe("IMPLEMENTATION_INTENT_RE", () => {
-  it("matches build/implement/add with a feature-ish noun", () => {
-    expect(matchesImplementationIntent("implement an endpoint for webhooks")).toBe(
-      true,
-    );
-    expect(matchesImplementationIntent("Build a new API route")).toBe(true);
-    expect(matchesImplementationIntent("Refactor the billing service")).toBe(
-      true,
-    );
+describe("matchesImplementationIntent", () => {
+  it("uses the classifier response for implementation intent", async () => {
+    await expect(
+      matchesImplementationIntent(
+        "implement an endpoint for webhooks",
+        makeCtx("s1", "YES"),
+      ),
+    ).resolves.toBe(true);
+    await expect(
+      matchesImplementationIntent("Build a new API route", makeCtx("s1", "YES")),
+    ).resolves.toBe(true);
+    await expect(
+      matchesImplementationIntent(
+        "Refactor the billing service",
+        makeCtx("s1", "YES"),
+      ),
+    ).resolves.toBe(true);
   });
 
-  it("does not match casual questions", () => {
-    expect(matchesImplementationIntent("what time is it")).toBe(false);
-    expect(matchesImplementationIntent("hello world")).toBe(false);
-    expect(matchesImplementationIntent("")).toBe(false);
-  });
-
-  it("is case-insensitive", () => {
-    expect(IMPLEMENTATION_INTENT_RE.test("WRITE A HANDLER")).toBe(true);
+  it("returns false for non-yes classifier responses", async () => {
+    await expect(
+      matchesImplementationIntent("what's the weather today?", makeCtx("s1", "NO")),
+    ).resolves.toBe(false);
+    await expect(
+      matchesImplementationIntent("hello world", makeCtx("s1", "maybe")),
+    ).resolves.toBe(false);
+    await expect(matchesImplementationIntent("", makeCtx("s1", "YES"))).resolves.toBe(
+      false,
+    );
   });
 });
 
@@ -113,7 +130,7 @@ describe("makePlanModeAutoTriggerHook", () => {
     const hook = makePlanModeAutoTriggerHook({ agent: agentWith("default") });
     const result = await hook.handler(
       buildArgs("please implement a new hook for invoicing"),
-      makeCtx(),
+      makeCtx("s1", "YES"),
     );
     expect(result?.action).toBe("replace");
     if (result?.action !== "replace") throw new Error("expected replace");
@@ -125,9 +142,22 @@ describe("makePlanModeAutoTriggerHook", () => {
     const hook = makePlanModeAutoTriggerHook({ agent: agentWith("default") });
     const result = await hook.handler(
       buildArgs("what's the weather today?"),
-      makeCtx(),
+      makeCtx("s1", "NO"),
     );
     expect(result).toEqual({ action: "continue" });
+  });
+
+  it("does not nudge document regeneration requests even if classifier says yes", async () => {
+    const hook = makePlanModeAutoTriggerHook({ agent: agentWith("default") });
+    const ctx = makeCtx("s1", "YES");
+    const result = await hook.handler(
+      buildArgs(
+        "아니 docx랑 pdf를 md형식 그대로 내뱉으면 어떡하냐 agentic하게 해서 이쁘게 잘 만들어야지",
+      ),
+      ctx,
+    );
+    expect(result).toEqual({ action: "continue" });
+    expect(ctx.llm.stream).not.toHaveBeenCalled();
   });
 
   it("skips when env gate is off", async () => {
