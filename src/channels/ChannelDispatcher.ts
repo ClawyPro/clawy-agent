@@ -118,6 +118,9 @@ export async function dispatchInbound(
     await session.runTurn(
       {
         text: inbound.text,
+        ...(inbound.attachments && inbound.attachments.length > 0
+          ? { attachments: inbound.attachments }
+          : {}),
         receivedAt: Date.now(),
         metadata: {
           source: inbound.channel,

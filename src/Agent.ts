@@ -480,6 +480,24 @@ export class Agent {
         gatewayToken: config.gatewayToken,
         botId: config.botId,
         chatProxyUrl: config.chatProxyUrl ?? "",
+        getSourceChannel: (ctx) => {
+          const turn = this.activeTurns.get(ctx.turnId);
+          return turn?.session.meta.channel ?? null;
+        },
+        sendFile: async (channel, filePath, caption, mode) => {
+          if (channel.type !== "telegram" && channel.type !== "discord") {
+            throw new Error(`FileSend does not support ${channel.type} channel delivery`);
+          }
+          const adapter = this.channelAdapters.find((a) => a.kind === channel.type);
+          if (!adapter) {
+            throw new Error(`FileSend ${channel.type} adapter not configured`);
+          }
+          if (mode === "photo") {
+            await adapter.sendPhoto(channel.channelId, filePath, caption);
+          } else {
+            await adapter.sendDocument(channel.channelId, filePath, caption);
+          }
+        },
       }),
     );
     this.tools.register(
