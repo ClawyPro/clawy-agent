@@ -1,13 +1,21 @@
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
+import { resolveGeneratedOutputPath } from "../output/generatedOutputPath.js";
 import type { OutputArtifactRegistry } from "../output/OutputArtifactRegistry.js";
+import { Workspace } from "../storage/Workspace.js";
 import type { Tool, ToolContext, ToolResult } from "../Tool.js";
 import { errorResult } from "../util/toolResult.js";
+import { convertDocxToPdf, type DocxToPdfConverter } from "./document/docxToPdfDriver.js";
 import { markdownToStructuredBlocks, writeDocxFromBlocks, type StructuredBlock } from "./document/docxDriver.js";
 import { renderMarkdownToHtml } from "./document/htmlDriver.js";
 import { writeHwpxFromBlocks, type HwpxTemplate } from "./document/hwpxDriver.js";
 import { writePdfFromBlocks } from "./document/pdfDriver.js";
+import {
+  writeDocumentAgentically,
+  type AgenticDocumentAuthorDeps,
+  type AgenticDocumentWriter,
+} from "./document/agenticAuthor.js";
 import {
   markdownToPlainText,
   structuredBlocksToMarkdown,
@@ -25,11 +33,13 @@ type DocumentWriteSourceInput =
       content?: string;
       markdown?: string;
       text?: string;
+      path?: string;
     }
   | {
       kind?: "structured";
       type?: "structured";
-      blocks: StructuredBlock[];
+      blocks?: StructuredBlock[];
+      blocksFile?: string;
     };
 
 const SUPPORTED_FORMATS: readonly DocumentOutputFormat[] = [
@@ -60,6 +70,12 @@ export interface DocumentWriteOutput {
   filename: string;
 }
 
+export interface DocumentWriteDeps {
+  agenticWriter?: AgenticDocumentWriter;
+  agentic?: AgenticDocumentAuthorDeps;
+  docxToPdfConverter?: DocxToPdfConverter;
+}
+
 const STRUCTURED_BLOCK_SCHEMA = {
   type: "object",
   properties: {
@@ -85,11 +101,16 @@ const SOURCE_SCHEMA = {
         content: { type: "string" },
         markdown: { type: "string" },
         text: { type: "string" },
+        path: {
+          type: "string",
+          description: "Workspace-relative markdown/text file path to read as source content.",
+        },
       },
       anyOf: [
         { required: ["content"] },
         { required: ["markdown"] },
         { required: ["text"] },
+        { required: ["path"] },
       ],
       additionalProperties: false,
     },
@@ -102,8 +123,15 @@ const SOURCE_SCHEMA = {
           type: "array",
           items: STRUCTURED_BLOCK_SCHEMA,
         },
+        blocksFile: {
+          type: "string",
+          description: "Workspace-relative JSON file containing an array of structured blocks or an object with a blocks array.",
+        },
       },
-      required: ["blocks"],
+      anyOf: [
+        { required: ["blocks"] },
+        { required: ["blocksFile"] },
+      ],
       additionalProperties: false,
     },
   ],
@@ -166,7 +194,15 @@ function firstStringField(raw: Record<string, unknown>, fields: readonly string[
   return null;
 }
 
-function normalizeSource(source: DocumentWriteInput["source"]): NormalizedDocumentSource {
+function kindOf(raw: Record<string, unknown>): string | undefined {
+  return typeof raw.kind === "string"
+    ? raw.kind
+    : typeof raw.type === "string"
+      ? raw.type
+      : undefined;
+}
+
+function normalizeInlineSource(source: DocumentWriteInput["source"]): NormalizedDocumentSource {
   if (typeof source === "string") {
     return { kind: "markdown", content: source };
   }
@@ -175,11 +211,7 @@ function normalizeSource(source: DocumentWriteInput["source"]): NormalizedDocume
   }
 
   const raw = source as Record<string, unknown>;
-  const kind = typeof raw.kind === "string"
-    ? raw.kind
-    : typeof raw.type === "string"
-      ? raw.type
-      : undefined;
+  const kind = kindOf(raw);
 
   const content = firstStringField(raw, ["content", "markdown", "text"]);
   if (content !== null && isMarkdownSourceKind(kind)) {
@@ -189,22 +221,94 @@ function normalizeSource(source: DocumentWriteInput["source"]): NormalizedDocume
     return { kind: "structured", blocks: raw.blocks as StructuredBlock[] };
   }
   if (kind === "structured") {
-    throw new Error("source.blocks must be an array for structured source");
+    throw new Error("source.blocks must be an array or source.blocksFile must be a string for structured source");
   }
   if (isMarkdownSourceKind(kind)) {
-    throw new Error("source.content must be a string for markdown source");
+    throw new Error("source.content or source.path must be a string for markdown source");
   }
   throw new Error(`unsupported source: ${kind ?? "undefined"}`);
+}
+
+function validateSourceShape(source: DocumentWriteInput["source"]): string | null {
+  if (typeof source === "string") return null;
+  if (!source || typeof source !== "object" || Array.isArray(source)) {
+    return "source must be a markdown string or an object with content, path, blocks, or blocksFile";
+  }
+  const raw = source as Record<string, unknown>;
+  const kind = kindOf(raw);
+  if (typeof raw.path === "string" && isMarkdownSourceKind(kind)) return null;
+  if (typeof raw.blocksFile === "string" && (kind === undefined || kind === "structured")) return null;
+  try {
+    normalizeInlineSource(source);
+    return null;
+  } catch (error) {
+    return error instanceof Error ? error.message : String(error);
+  }
+}
+
+async function readMarkdownSourcePath(
+  workspaceRoot: string,
+  relPath: string,
+): Promise<NormalizedDocumentSource> {
+  const workspace = new Workspace(workspaceRoot);
+  const content = await workspace.readFile(relPath);
+  return { kind: "markdown", content };
+}
+
+function parseStructuredBlocksFile(rawJson: string, relPath: string): StructuredBlock[] {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(rawJson);
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    throw new Error(`source.blocksFile is not valid JSON (${relPath}): ${message}`);
+  }
+  const blocks = Array.isArray(parsed)
+    ? parsed
+    : parsed && typeof parsed === "object" && Array.isArray((parsed as { blocks?: unknown }).blocks)
+      ? (parsed as { blocks: unknown[] }).blocks
+      : null;
+  if (!blocks) {
+    throw new Error("source.blocksFile must contain a JSON array or an object with a blocks array");
+  }
+  return blocks as StructuredBlock[];
+}
+
+async function readStructuredBlocksFile(
+  workspaceRoot: string,
+  relPath: string,
+): Promise<NormalizedDocumentSource> {
+  const workspace = new Workspace(workspaceRoot);
+  const content = await workspace.readFile(relPath);
+  return { kind: "structured", blocks: parseStructuredBlocksFile(content, relPath) };
+}
+
+async function normalizeSource(
+  source: DocumentWriteInput["source"],
+  workspaceRoot: string,
+): Promise<NormalizedDocumentSource> {
+  if (source && typeof source === "object" && !Array.isArray(source)) {
+    const raw = source as Record<string, unknown>;
+    const kind = kindOf(raw);
+    if (typeof raw.path === "string" && isMarkdownSourceKind(kind)) {
+      return readMarkdownSourcePath(workspaceRoot, raw.path);
+    }
+    if (typeof raw.blocksFile === "string" && (kind === undefined || kind === "structured")) {
+      return readStructuredBlocksFile(workspaceRoot, raw.blocksFile);
+    }
+  }
+  return normalizeInlineSource(source);
 }
 
 async function maybeCreateHwpxReferenceCopy(
   workspaceRoot: string,
   input: DocumentWriteInput,
+  workspacePath: string,
 ): Promise<string | null> {
   if (input.mode !== "edit" || input.format !== "hwpx") {
     return null;
   }
-  const sourcePath = path.join(workspaceRoot, input.filename);
+  const sourcePath = path.join(workspaceRoot, workspacePath);
   try {
     await fs.access(sourcePath);
   } catch {
@@ -217,14 +321,118 @@ async function maybeCreateHwpxReferenceCopy(
   return referencePath;
 }
 
+function sourceToMarkdown(source: NormalizedDocumentSource): string {
+  return source.kind === "markdown"
+    ? source.content
+    : structuredBlocksToMarkdown(source.blocks);
+}
+
+async function writeDocumentFast(
+  input: DocumentWriteInput,
+  source: NormalizedDocumentSource,
+  absPath: string,
+  referencePath: string | null,
+): Promise<void> {
+  if (input.format === "html" && source.kind === "markdown") {
+    await fs.writeFile(absPath, renderMarkdownToHtml(source.content), "utf8");
+  } else if (input.format === "html" && source.kind === "structured") {
+    await fs.writeFile(absPath, renderMarkdownToHtml(structuredBlocksToMarkdown(source.blocks)), "utf8");
+  } else if (input.format === "docx" && source.kind === "structured") {
+    await writeDocxFromBlocks(absPath, source.blocks);
+  } else if (input.format === "docx" && source.kind === "markdown") {
+    await writeDocxFromBlocks(absPath, markdownToStructuredBlocks(source.content));
+  } else if (input.format === "hwpx" && source.kind === "structured") {
+    await writeHwpxFromBlocks({
+      absPath,
+      title: input.title,
+      template: input.template,
+      blocks: source.blocks,
+      referencePath: referencePath ?? undefined,
+    });
+  } else if (input.format === "hwpx" && source.kind === "markdown") {
+    await writeHwpxFromBlocks({
+      absPath,
+      title: input.title,
+      template: input.template,
+      blocks: markdownToStructuredBlocks(source.content),
+      referencePath: referencePath ?? undefined,
+    });
+  } else if (input.format === "md" && source.kind === "structured") {
+    await writeTextFile(absPath, structuredBlocksToMarkdown(source.blocks));
+  } else if (input.format === "md" && source.kind === "markdown") {
+    await writeTextFile(absPath, source.content);
+  } else if (input.format === "txt" && source.kind === "structured") {
+    await writeTextFile(absPath, structuredBlocksToPlainText(source.blocks));
+  } else if (input.format === "txt" && source.kind === "markdown") {
+    await writeTextFile(absPath, markdownToPlainText(source.content));
+  } else if (input.format === "pdf" && source.kind === "structured") {
+    await writePdfFromBlocks(absPath, input.title, source.blocks);
+  } else if (input.format === "pdf" && source.kind === "markdown") {
+    await writePdfFromBlocks(absPath, input.title, markdownToStructuredBlocks(source.content));
+  } else {
+    throw new Error(`unsupported combination: ${input.format}/${source.kind}`);
+  }
+}
+
+function messageForError(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
+}
+
+async function writePdfViaAgenticDocx(
+  input: DocumentWriteInput,
+  source: NormalizedDocumentSource,
+  absPath: string,
+  workspacePath: string,
+  workspaceRoot: string,
+  ctx: ToolContext,
+  agenticWriter: AgenticDocumentWriter,
+  docxToPdfConverter: DocxToPdfConverter,
+): Promise<Record<string, unknown>> {
+  const tempRoot = await fs.mkdtemp(path.join(os.tmpdir(), "document-write-pdf-docx-"));
+  const docxPath = path.join(tempRoot, "intermediate.docx");
+  try {
+    const intermediateFilename = workspacePath.replace(/\.pdf$/i, ".docx");
+    const agenticResult = await agenticWriter({
+      format: "docx",
+      mode: input.mode,
+      title: input.title,
+      filename: intermediateFilename === workspacePath ? `${workspacePath}.docx` : intermediateFilename,
+      absPath: docxPath,
+      workspaceRoot,
+      sourceMarkdown: sourceToMarkdown(source),
+      ctx,
+    });
+    try {
+      await docxToPdfConverter({
+        docxPath,
+        pdfPath: absPath,
+        abortSignal: ctx.abortSignal,
+      });
+    } catch (error) {
+      throw new Error(`pdf_conversion:${messageForError(error)}`);
+    }
+    return {
+      documentWriteMode: "agentic_docx_pdf",
+      agenticIntermediateFormat: "docx",
+      agenticTurns: agenticResult.turns,
+      agenticToolCallCount: agenticResult.toolCallCount,
+      pdfConversionMode: "docx_to_pdf",
+      ...(agenticResult.model ? { agenticModel: agenticResult.model } : {}),
+    };
+  } finally {
+    await fs.rm(tempRoot, { recursive: true, force: true });
+  }
+}
+
 export function makeDocumentWriteTool(
   workspaceRoot: string,
   outputRegistry: OutputArtifactRegistry,
+  deps: DocumentWriteDeps = {},
 ): Tool<DocumentWriteInput, DocumentWriteOutput> {
   return {
     name: "DocumentWrite",
     description:
-      "Create or edit user-facing md, txt, html, pdf, docx, and hwpx documents inside the bot workspace and register the result as an output artifact.",
+      "Create or edit user-facing md, txt, html, pdf, docx, and hwpx documents inside the bot workspace and register the result as an output artifact. DOCX/HWPX use an agentic authoring loop when available; PDF uses agentic DOCX authoring followed by deterministic DOCX-to-PDF conversion when available. Source may be inline markdown/blocks or a workspace-relative path/blocksFile.",
     inputSchema: INPUT_SCHEMA,
     permission: "write",
     validate(input) {
@@ -241,7 +449,8 @@ export function makeDocumentWriteTool(
         return "`filename` is required";
       }
       try {
-        normalizeSource(input.source);
+        const sourceError = validateSourceShape(input.source);
+        if (sourceError) return `invalid source: ${sourceError}`;
       } catch (error) {
         const message = error instanceof Error ? error.message : String(error);
         return `invalid source: ${message}`;
@@ -255,41 +464,73 @@ export function makeDocumentWriteTool(
       const start = Date.now();
       let referencePath: string | null = null;
       try {
-        const source = normalizeSource(input.source);
-        const absPath = path.join(workspaceRoot, input.filename);
+        const source = await normalizeSource(input.source, workspaceRoot);
+        const outputPath = resolveGeneratedOutputPath(input.filename);
+        const absPath = path.join(workspaceRoot, outputPath.workspacePath);
         await fs.mkdir(path.dirname(absPath), { recursive: true });
-        referencePath = await maybeCreateHwpxReferenceCopy(workspaceRoot, input);
+        referencePath = await maybeCreateHwpxReferenceCopy(workspaceRoot, input, outputPath.workspacePath);
+        let writeMetadata: Record<string, unknown> = { documentWriteMode: "fast" };
+        let agenticWriter = deps.agenticWriter;
+        if (!agenticWriter && deps.agentic) {
+          const agenticDeps = deps.agentic;
+          agenticWriter = (args) => writeDocumentAgentically(args, agenticDeps);
+        }
+        const docxToPdfConverter = deps.docxToPdfConverter ?? convertDocxToPdf;
 
-        if (input.format === "html" && source.kind === "markdown") {
-          await fs.writeFile(absPath, renderMarkdownToHtml(source.content), "utf8");
-        } else if (input.format === "html" && source.kind === "structured") {
-          await fs.writeFile(absPath, renderMarkdownToHtml(structuredBlocksToMarkdown(source.blocks)), "utf8");
-        } else if (input.format === "docx" && source.kind === "structured") {
-          await writeDocxFromBlocks(absPath, source.blocks);
-        } else if (input.format === "docx" && source.kind === "markdown") {
-          await writeDocxFromBlocks(absPath, markdownToStructuredBlocks(source.content));
-        } else if (input.format === "hwpx" && source.kind === "structured") {
-          await writeHwpxFromBlocks({
-            absPath,
-            title: input.title,
-            template: input.template,
-            blocks: source.blocks,
-            referencePath: referencePath ?? undefined,
-          });
-        } else if (input.format === "md" && source.kind === "structured") {
-          await writeTextFile(absPath, structuredBlocksToMarkdown(source.blocks));
-        } else if (input.format === "md" && source.kind === "markdown") {
-          await writeTextFile(absPath, source.content);
-        } else if (input.format === "txt" && source.kind === "structured") {
-          await writeTextFile(absPath, structuredBlocksToPlainText(source.blocks));
-        } else if (input.format === "txt" && source.kind === "markdown") {
-          await writeTextFile(absPath, markdownToPlainText(source.content));
-        } else if (input.format === "pdf" && source.kind === "structured") {
-          await writePdfFromBlocks(absPath, input.title, source.blocks);
-        } else if (input.format === "pdf" && source.kind === "markdown") {
-          await writePdfFromBlocks(absPath, input.title, markdownToStructuredBlocks(source.content));
+        if (input.format === "pdf" && agenticWriter) {
+          try {
+            writeMetadata = await writePdfViaAgenticDocx(
+              input,
+              source,
+              absPath,
+              outputPath.workspacePath,
+              workspaceRoot,
+              ctx,
+              agenticWriter,
+              docxToPdfConverter,
+            );
+          } catch (error) {
+            const message = messageForError(error);
+            writeMetadata = message.startsWith("pdf_conversion:")
+              ? {
+                  documentWriteMode: "fast_fallback",
+                  pdfConversionError: message.slice("pdf_conversion:".length),
+                }
+              : {
+                  documentWriteMode: "fast_fallback",
+                  agenticError: message,
+                };
+            await writeDocumentFast(input, source, absPath, referencePath);
+          }
+        } else if ((input.format === "docx" || input.format === "hwpx") && agenticWriter) {
+          try {
+            const agenticResult = await agenticWriter({
+              format: input.format,
+              mode: input.mode,
+              title: input.title,
+              filename: outputPath.workspacePath,
+              absPath,
+              workspaceRoot,
+              sourceMarkdown: sourceToMarkdown(source),
+              template: input.template,
+              referencePath: input.format === "hwpx" ? referencePath ?? undefined : undefined,
+              ctx,
+            });
+            writeMetadata = {
+              documentWriteMode: "agentic",
+              agenticTurns: agenticResult.turns,
+              agenticToolCallCount: agenticResult.toolCallCount,
+              ...(agenticResult.model ? { agenticModel: agenticResult.model } : {}),
+            };
+          } catch (error) {
+            writeMetadata = {
+              documentWriteMode: "fast_fallback",
+              agenticError: messageForError(error),
+            };
+            await writeDocumentFast(input, source, absPath, referencePath);
+          }
         } else {
-          throw new Error(`unsupported combination: ${input.format}/${source.kind}`);
+          await writeDocumentFast(input, source, absPath, referencePath);
         }
 
         const artifact = await outputRegistry.register({
@@ -298,9 +539,9 @@ export function makeDocumentWriteTool(
           kind: "document",
           format: input.format,
           title: input.title,
-          filename: basename(input.filename),
+          filename: outputPath.filename,
           mimeType: mimeTypeFor(input.format),
-          workspacePath: input.filename,
+          workspacePath: outputPath.workspacePath,
           previewKind: previewKindFor(input.format),
           createdByTool: "DocumentWrite",
           sourceKind: source.kind,
@@ -310,10 +551,11 @@ export function makeDocumentWriteTool(
           status: "ok",
           output: {
             artifactId: artifact.artifactId,
-            workspacePath: input.filename,
-            filename: basename(input.filename),
+            workspacePath: outputPath.workspacePath,
+            filename: outputPath.filename,
           },
           durationMs: Date.now() - start,
+          metadata: writeMetadata,
         };
       } catch (error) {
         return errorResult(error, start);

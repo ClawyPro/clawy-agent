@@ -4,38 +4,83 @@ import path from "node:path";
 import PDFDocument from "pdfkit";
 import type { StructuredBlock } from "./docxDriver.js";
 
-const REGULAR_FONT_CANDIDATES = [
-  "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
-  "/usr/share/fonts/opentype/noto/NotoSansCJKkr-Regular.otf",
-  "/System/Library/Fonts/Supplemental/AppleGothic.ttf",
-  "/System/Library/Fonts/AppleSDGothicNeo.ttc",
+export interface PdfFontCandidate {
+  path: string;
+  collectionFace?: string;
+}
+
+export interface ConfiguredPdfFont {
+  fontName: string;
+  fontPath: string | null;
+  cjkCapable: boolean;
+}
+
+export const PDF_BODY_FONT_CANDIDATES: readonly PdfFontCandidate[] = [
+  {
+    path: "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
+    collectionFace: "NotoSansCJKkr-Regular",
+  },
+  { path: "/usr/share/fonts/opentype/noto/NotoSansCJKkr-Regular.otf" },
+  { path: "/System/Library/Fonts/Supplemental/AppleGothic.ttf" },
+  {
+    path: "/System/Library/Fonts/AppleSDGothicNeo.ttc",
+    collectionFace: "AppleSDGothicNeo-Regular",
+  },
 ];
 
-async function firstExistingPath(candidates: readonly string[]): Promise<string | null> {
+async function fileExists(candidatePath: string): Promise<boolean> {
+  try {
+    await fsPromises.access(candidatePath);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+async function firstExistingPath(candidates: readonly PdfFontCandidate[]): Promise<PdfFontCandidate | null> {
   for (const candidate of candidates) {
-    try {
-      await fsPromises.access(candidate);
+    if (await fileExists(candidate.path)) {
       return candidate;
-    } catch {
-      // Try the next known platform font path.
     }
   }
   return null;
 }
 
-async function configureBodyFont(doc: PDFKit.PDFDocument): Promise<string> {
-  const fontPath = await firstExistingPath(REGULAR_FONT_CANDIDATES);
-  if (!fontPath) {
-    return "Helvetica";
+export async function configureBodyFont(
+  doc: Pick<PDFKit.PDFDocument, "font" | "registerFont">,
+  candidates: readonly PdfFontCandidate[] = PDF_BODY_FONT_CANDIDATES,
+): Promise<ConfiguredPdfFont> {
+  const existingFirst = await firstExistingPath(candidates);
+  if (!existingFirst) {
+    return { cjkCapable: false, fontName: "Helvetica", fontPath: null };
   }
 
-  try {
-    doc.registerFont("ClawyBody", fontPath);
-    doc.font("ClawyBody");
-    return "ClawyBody";
-  } catch {
-    return "Helvetica";
+  for (const candidate of candidates) {
+    if (!(await fileExists(candidate.path))) {
+      continue;
+    }
+
+    try {
+      // PDFKit requires the PostScript face name for TTC collections. Without
+      // it, Debian's Noto CJK collection opens as a collection object and text
+      // rendering falls back to the standard WinAnsi fonts.
+      doc.registerFont("ClawyBody", candidate.path, candidate.collectionFace);
+      doc.font("ClawyBody");
+      return { cjkCapable: true, fontName: "ClawyBody", fontPath: candidate.path };
+    } catch {
+      // Try the next known platform font path.
+    }
   }
+
+  return { cjkCapable: false, fontName: "Helvetica", fontPath: null };
+}
+
+function containsCjkText(text: string): boolean {
+  return /[\u1100-\u11ff\u2e80-\ua4cf\uac00-\ud7af\uf900-\ufaff]/u.test(text);
+}
+
+function blocksContainCjk(blocks: StructuredBlock[]): boolean {
+  return blocks.some((block) => containsCjkText(block.text));
 }
 
 function addParagraph(doc: PDFKit.PDFDocument, text: string, fontName: string): void {
@@ -76,11 +121,19 @@ export async function writePdfFromBlocks(
     doc.on("error", reject);
     doc.pipe(output);
 
+    const documentBlocks = blocks.length > 0
+      ? blocks
+      : [{ type: "heading" as const, level: 1 as const, text: title }];
+
     void configureBodyFont(doc)
-      .then((fontName) => {
-        const documentBlocks = blocks.length > 0
-          ? blocks
-          : [{ type: "heading" as const, level: 1 as const, text: title }];
+      .then((configuredFont) => {
+        if (!configuredFont.cjkCapable && blocksContainCjk(documentBlocks)) {
+          throw new Error(
+            "PDF CJK font unavailable; refusing to generate a Korean/Chinese/Japanese PDF with a fallback font.",
+          );
+        }
+
+        const fontName = configuredFont.fontName;
         for (const block of documentBlocks) {
           if (block.type === "heading") {
             addHeading(doc, block, fontName);

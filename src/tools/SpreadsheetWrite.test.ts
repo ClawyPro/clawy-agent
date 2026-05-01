@@ -52,6 +52,39 @@ afterEach(async () => {
 });
 
 describe("SpreadsheetWrite", () => {
+  it("stores generated spreadsheets under outputs when callers provide a bare filename", async () => {
+    const root = await makeRoot();
+    const registry = new OutputArtifactRegistry(root);
+    const tool = makeSpreadsheetWriteTool(root, registry);
+
+    const result = await tool.execute(
+      {
+        mode: "create",
+        title: "Forecast",
+        filename: "forecast.xlsx",
+        sheets: [{ name: "Summary", rows: [["Metric", "Value"], ["ARR", 1200]] }],
+      },
+      makeCtx(root),
+    );
+
+    expect(result.status).toBe("ok");
+
+    const workbook = new ExcelJS.Workbook();
+    await workbook.xlsx.readFile(path.join(root, "outputs", "forecast.xlsx"));
+    expect(workbook.getWorksheet("Summary")?.getCell("A2").value).toBe("ARR");
+    await expect(fs.access(path.join(root, "forecast.xlsx"))).rejects.toThrow();
+
+    const record = await registry.get(result.output!.artifactId);
+    expect(result.output).toMatchObject({
+      workspacePath: "outputs/forecast.xlsx",
+      filename: "forecast.xlsx",
+    });
+    expect(record).toMatchObject({
+      workspacePath: "outputs/forecast.xlsx",
+      filename: "forecast.xlsx",
+    });
+  });
+
   it("declares items for every array schema exposed to upstream providers", async () => {
     const root = await makeRoot();
     const registry = new OutputArtifactRegistry(root);
@@ -88,7 +121,7 @@ describe("SpreadsheetWrite", () => {
     expect(result.status).toBe("ok");
 
     const workbook = new ExcelJS.Workbook();
-    await workbook.xlsx.readFile(path.join(root, "exports", "quarterly-revenue.xlsx"));
+    await workbook.xlsx.readFile(path.join(root, "outputs", "exports", "quarterly-revenue.xlsx"));
     const sheet = workbook.getWorksheet("Revenue");
 
     expect(sheet?.getCell("A2").value).toBe("Jan");
@@ -99,7 +132,7 @@ describe("SpreadsheetWrite", () => {
       kind: "spreadsheet",
       format: "xlsx",
       filename: "quarterly-revenue.xlsx",
-      workspacePath: "exports/quarterly-revenue.xlsx",
+      workspacePath: "outputs/exports/quarterly-revenue.xlsx",
     });
   });
 
@@ -109,8 +142,8 @@ describe("SpreadsheetWrite", () => {
     const workbook = new ExcelJS.Workbook();
     const sheet = workbook.addWorksheet("Sheet1");
     sheet.getCell("A1").value = "Draft";
-    await fs.mkdir(path.join(root, "exports"), { recursive: true });
-    await workbook.xlsx.writeFile(path.join(root, "exports", "draft.xlsx"));
+    await fs.mkdir(path.join(root, "outputs", "exports"), { recursive: true });
+    await workbook.xlsx.writeFile(path.join(root, "outputs", "exports", "draft.xlsx"));
 
     const tool = makeSpreadsheetWriteTool(root, registry);
     const result = await tool.execute(
@@ -129,7 +162,7 @@ describe("SpreadsheetWrite", () => {
     expect(result.status).toBe("ok");
 
     const reloaded = new ExcelJS.Workbook();
-    await reloaded.xlsx.readFile(path.join(root, "exports", "draft.xlsx"));
+    await reloaded.xlsx.readFile(path.join(root, "outputs", "exports", "draft.xlsx"));
     const reloadedSheet = reloaded.getWorksheet("Sheet1");
 
     expect(reloadedSheet?.getCell("A1").value).toBe("Final");

@@ -19,6 +19,20 @@ async function makeRoot(): Promise<string> {
   return root;
 }
 
+async function readHwpxEntry(absPath: string, entry: string): Promise<string> {
+  const { stdout } = await execFileAsync("python3", [
+    "-c",
+    [
+      "import sys, zipfile",
+      "with zipfile.ZipFile(sys.argv[1]) as zf:",
+      "    sys.stdout.write(zf.read(sys.argv[2]).decode('utf-8'))",
+    ].join("\n"),
+    absPath,
+    entry,
+  ]);
+  return stdout;
+}
+
 afterEach(async () => {
   await Promise.all(
     roots.splice(0).map((root) => fs.rm(root, { recursive: true, force: true })),
@@ -47,6 +61,42 @@ describe("writeHwpxFromBlocks", () => {
       absPath,
     ]);
 
+    expect(stdout).toContain("VALID:");
+  });
+
+  it("renders headings, bullets, and markdown-like tables as styled HWPX structure", async () => {
+    const root = await makeRoot();
+    const absPath = path.join(root, "investment-report.hwpx");
+    const blocks: StructuredBlock[] = [
+      { type: "heading", level: 1, text: "투자심사 리포트" },
+      { type: "paragraph", text: "요약: 프리미엄 증류주 시장성과 수익성을 확인했습니다." },
+      { type: "heading", level: 2, text: "핵심 지표" },
+      { type: "paragraph", text: "지표 | 값 | 판단\n매출 | 2.1억 | 성장\n영업이익 | 0.01억 | 흑자 전환" },
+      { type: "heading", level: 2, text: "실행 과제" },
+      { type: "paragraph", text: "• 브랜드 스토리 정리\n• 원료 IP 확장" },
+    ];
+
+    await writeHwpxFromBlocks({
+      absPath,
+      title: "투자심사 리포트",
+      blocks,
+    });
+
+    const section = await readHwpxEntry(absPath, "Contents/section0.xml");
+    expect(section).toMatch(/charPrIDRef="7"[\s\S]*<hp:t>투자심사 리포트<\/hp:t>/);
+    expect(section).toMatch(/charPrIDRef="8"[\s\S]*<hp:t>핵심 지표<\/hp:t>/);
+    expect(section).toContain("<hp:tbl");
+    expect(section).toContain('rowCnt="3"');
+    expect(section).toContain('colCnt="3"');
+    expect(section).toContain("<hp:t>매출</hp:t>");
+    expect(section).not.toContain("지표 | 값 | 판단");
+    expect(section).toContain("<hp:t>• 브랜드 스토리 정리</hp:t>");
+    expect(section).toContain("<hp:t>• 원료 IP 확장</hp:t>");
+
+    const { stdout } = await execFileAsync("python3", [
+      HWPX_VALIDATE_SCRIPT,
+      absPath,
+    ]);
     expect(stdout).toContain("VALID:");
   });
 
