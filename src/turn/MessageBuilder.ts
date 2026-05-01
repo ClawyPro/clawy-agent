@@ -11,8 +11,15 @@
  * not here — this module is purely about message assembly.
  */
 
+import fs from "node:fs/promises";
+import path from "node:path";
 import type { Session } from "../Session.js";
-import type { ReplyToRef, UserMessage } from "../util/types.js";
+import type {
+  ImageContentBlock,
+  MessageAttachment,
+  ReplyToRef,
+  UserMessage,
+} from "../util/types.js";
 import type { LLMContentBlock, LLMMessage } from "../transport/LLMClient.js";
 import { renderIdentitySystem } from "../storage/Workspace.js";
 import { getCapability } from "../llm/modelCapabilities.js";
@@ -71,6 +78,51 @@ export function formatReplyPreamble(replyTo: ReplyToRef): string {
       ? `${collapsed.slice(0, REPLY_PREVIEW_MAX_CHARS)}…`
       : collapsed;
   return `[Reply to ${replyTo.role}: "${truncated}"]`;
+}
+
+const SUPPORTED_IMAGE_MEDIA_TYPES = new Set([
+  "image/jpeg",
+  "image/png",
+  "image/gif",
+  "image/webp",
+]);
+
+function formatBytes(sizeBytes: number | undefined): string {
+  return typeof sizeBytes === "number" && Number.isFinite(sizeBytes)
+    ? `, ${sizeBytes} bytes`
+    : "";
+}
+
+function workspacePathForAttachment(
+  attachment: MessageAttachment,
+  workspaceRoot: string | undefined,
+): string | null {
+  if (!attachment.localPath || !workspaceRoot) return null;
+  const root = path.resolve(workspaceRoot);
+  const resolved = path.resolve(attachment.localPath);
+  if (resolved === root || !resolved.startsWith(root + path.sep)) {
+    return null;
+  }
+  return path.relative(root, resolved);
+}
+
+function formatAttachmentLine(
+  attachment: MessageAttachment,
+  workspaceRoot: string | undefined,
+): string {
+  const name = attachment.name ?? "attachment";
+  const mime = attachment.mimeType
+    ? ` (${attachment.mimeType}${formatBytes(attachment.sizeBytes)})`
+    : "";
+  const workspacePath = workspacePathForAttachment(attachment, workspaceRoot);
+  const location = workspacePath
+    ? ` workspace_path=${workspacePath}`
+    : attachment.localPath
+      ? ` local_path=${attachment.localPath}`
+      : attachment.url
+        ? ` url=${attachment.url}`
+        : "";
+  return `- ${attachment.kind}: ${name}${mime}${location}`;
 }
 
 function runtimeModelLabel(model: string, provider?: string): string {
@@ -146,6 +198,50 @@ function buildKbCommandContract(userText: string): LLMMessage {
     role: "user",
     content: [{ type: "text", text: lines.join("\n") }],
   };
+}
+
+function formatAttachmentsPreamble(
+  attachments: MessageAttachment[] | undefined,
+  workspaceRoot: string | undefined,
+): string {
+  if (!attachments || attachments.length === 0) return "";
+  const lines = attachments.map((attachment) =>
+    formatAttachmentLine(attachment, workspaceRoot),
+  );
+  return `<attachments>\n${lines.join("\n")}\n</attachments>`;
+}
+
+async function imageBlocksFromAttachments(
+  attachments: MessageAttachment[] | undefined,
+): Promise<ImageContentBlock[]> {
+  if (!attachments || attachments.length === 0) return [];
+  const blocks: ImageContentBlock[] = [];
+  for (const attachment of attachments) {
+    if (attachment.kind !== "image" || !attachment.localPath) continue;
+    if (
+      !attachment.mimeType ||
+      !SUPPORTED_IMAGE_MEDIA_TYPES.has(attachment.mimeType)
+    ) {
+      continue;
+    }
+    try {
+      const data = await fs.readFile(attachment.localPath);
+      blocks.push({
+        type: "image",
+        source: {
+          type: "base64",
+          media_type:
+            attachment.mimeType as ImageContentBlock["source"]["media_type"],
+          data: data.toString("base64"),
+        },
+      });
+    } catch (err) {
+      console.warn(
+        `[message-builder] image attachment read failed path=${attachment.localPath}: ${(err as Error).message}`,
+      );
+    }
+  }
+  return blocks;
 }
 
 function buildRuntimeModelIdentityText(ctx: RuntimeModelIdentityContext): string {
@@ -333,10 +429,20 @@ export async function buildMessages(
   // `[Channel: …]` hint pattern (commit 4b3fa5e0) — both go in the
   // system/user preamble so the model sees them on every turn.
   const replyTo = userMessage.metadata?.replyTo;
-  const userContent = replyTo
+  const baseUserContent = replyTo
     ? `${formatReplyPreamble(replyTo)}\n${userMessage.text}`
     : userMessage.text;
-  const imageBlocks = userMessage.imageBlocks ?? [];
+  const attachmentPreamble = formatAttachmentsPreamble(
+    userMessage.attachments,
+    session.agent.config.workspaceRoot,
+  );
+  const userContent = [baseUserContent, attachmentPreamble]
+    .filter((part) => part.length > 0)
+    .join("\n\n");
+  const imageBlocks = [
+    ...(userMessage.imageBlocks ?? []),
+    ...(await imageBlocksFromAttachments(userMessage.attachments)),
+  ];
   if (imageBlocks.length > 0) {
     out.push({
       role: "user",

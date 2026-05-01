@@ -37,15 +37,16 @@ async function makeSession(opts: {
   replayMessages?: LLMMessage[];
   channel?: { type: string; channelId: string } | null;
   maybeCompactResult?: unknown;
+  workspaceRoot?: string;
 }): Promise<{
   session: Session;
   transcript: Transcript;
   contextCalls: ContextEngineCall[];
   readCommittedCount: () => number;
 }> {
-  const workspaceRoot = await fs.mkdtemp(
-    path.join(os.tmpdir(), "msg-builder-"),
-  );
+  const workspaceRoot =
+    opts.workspaceRoot ??
+    (await fs.mkdtemp(path.join(os.tmpdir(), "msg-builder-")));
   const sessionsDir = path.join(workspaceRoot, "sessions");
   await fs.mkdir(sessionsDir, { recursive: true });
 
@@ -90,7 +91,7 @@ async function makeSession(opts: {
     meta,
     transcript,
     agent: {
-      config: { model: opts.model ?? "unknown-model-x" },
+      config: { model: opts.model ?? "unknown-model-x", workspaceRoot },
       contextEngine,
       workspace,
     },
@@ -377,6 +378,79 @@ describe("MessageBuilder.buildMessages", () => {
     };
     const out = await buildMessages(session, um);
     expect(out[out.length - 1]?.content).toBe("plain text");
+  });
+
+  it("renders downloaded file attachments as workspace-relative references", async () => {
+    const workspaceRoot = await fs.mkdtemp(path.join(os.tmpdir(), "msg-builder-"));
+    try {
+      const { session } = await makeSession({ workspaceRoot });
+      const localPath = path.join(workspaceRoot, "telegram-downloads", "report.pdf");
+      await fs.mkdir(path.dirname(localPath), { recursive: true });
+      await fs.writeFile(localPath, "PDF");
+
+      const out = await buildMessages(session, {
+        text: "summarize this",
+        receivedAt: Date.now(),
+        attachments: [
+          {
+            kind: "file",
+            name: "report.pdf",
+            mimeType: "application/pdf",
+            localPath,
+            sizeBytes: 3,
+          },
+        ],
+      });
+
+      expect(out[out.length - 1]?.content).toBe(
+        "summarize this\n\n<attachments>\n- file: report.pdf (application/pdf, 3 bytes) workspace_path=telegram-downloads/report.pdf\n</attachments>",
+      );
+    } finally {
+      await fs.rm(workspaceRoot, { recursive: true, force: true });
+    }
+  });
+
+  it("turns downloaded image attachments into Anthropic image blocks", async () => {
+    const workspaceRoot = await fs.mkdtemp(path.join(os.tmpdir(), "msg-builder-"));
+    try {
+      const { session } = await makeSession({ workspaceRoot });
+      const localPath = path.join(workspaceRoot, "discord-downloads", "photo.png");
+      await fs.mkdir(path.dirname(localPath), { recursive: true });
+      await fs.writeFile(localPath, Buffer.from([1, 2, 3]));
+
+      const out = await buildMessages(session, {
+        text: "",
+        receivedAt: Date.now(),
+        attachments: [
+          {
+            kind: "image",
+            name: "photo.png",
+            mimeType: "image/png",
+            localPath,
+          },
+        ],
+      });
+
+      expect(out[out.length - 1]).toEqual({
+        role: "user",
+        content: [
+          {
+            type: "text",
+            text: "<attachments>\n- image: photo.png (image/png) workspace_path=discord-downloads/photo.png\n</attachments>",
+          },
+          {
+            type: "image",
+            source: {
+              type: "base64",
+              media_type: "image/png",
+              data: "AQID",
+            },
+          },
+        ],
+      });
+    } finally {
+      await fs.rm(workspaceRoot, { recursive: true, force: true });
+    }
   });
 
   it("emits a mixed Anthropic user content array when image blocks exist", async () => {
