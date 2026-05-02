@@ -2,6 +2,34 @@ export type VerificationMode = "none" | "sample" | "full";
 export type ExecutionControlMode = "light" | "heavy";
 export type AcceptanceCriterionStatus = "pending" | "passed" | "failed" | "waived";
 export type ResourceBindingMode = "audit" | "enforce";
+export type DeterministicRequirementKind =
+  | "clock"
+  | "date_range"
+  | "calculation"
+  | "counting"
+  | "data_query"
+  | "comparison";
+export type DeterministicRequirementSource =
+  | "llm_classifier"
+  | "user_harness"
+  | "task_contract"
+  | "manual";
+export type DeterministicRequirementStatus =
+  | "active"
+  | "satisfied"
+  | "failed"
+  | "waived";
+export type DeterministicEvidenceKind =
+  | "clock"
+  | "date_range"
+  | "calculation"
+  | "data_query"
+  | "verification";
+export type DeterministicEvidenceStatus =
+  | "passed"
+  | "failed"
+  | "partial"
+  | "unknown";
 export type UsedResourceKind =
   | "workspace_path"
   | "source_path"
@@ -31,6 +59,35 @@ export interface ResourceBindings {
   artifactIds: string[];
   resourceIds: string[];
   dbHandles: string[];
+}
+
+export interface DeterministicRequirement {
+  requirementId: string;
+  turnId?: string;
+  source: DeterministicRequirementSource;
+  status: DeterministicRequirementStatus;
+  kinds: DeterministicRequirementKind[];
+  reason: string;
+  suggestedTools: string[];
+  acceptanceCriteria: string[];
+  evidenceIds: string[];
+  createdAt: number;
+  updatedAt: number;
+}
+
+export interface DeterministicEvidenceRecord {
+  evidenceId: string;
+  turnId?: string;
+  requirementIds: string[];
+  toolName: string;
+  toolUseId?: string;
+  kind: DeterministicEvidenceKind;
+  status: DeterministicEvidenceStatus;
+  inputSummary: string;
+  output: unknown;
+  assertions: string[];
+  resources: string[];
+  recordedAt: number;
 }
 
 export interface UsedResourceRecord {
@@ -68,6 +125,8 @@ export interface ExecutionTaskState {
   acceptanceCriteria: string[];
   resourceBindings: ResourceBindings;
   usedResources: UsedResourceRecord[];
+  deterministicRequirements: DeterministicRequirement[];
+  deterministicEvidence: DeterministicEvidenceRecord[];
   verificationMode: VerificationMode;
   verificationEvidence: VerificationEvidenceRecord[];
   artifacts: string[];
@@ -128,6 +187,8 @@ export class ExecutionContractStore {
         acceptanceCriteria: [],
         resourceBindings: defaultResourceBindings(),
         usedResources: [],
+        deterministicRequirements: [],
+        deterministicEvidence: [],
         verificationMode: "none",
         verificationEvidence: [],
         artifacts: [],
@@ -253,6 +314,77 @@ export class ExecutionContractStore {
     });
   }
 
+  recordDeterministicRequirement(
+    input: Omit<
+      DeterministicRequirement,
+      "createdAt" | "updatedAt" | "evidenceIds"
+    > & { evidenceIds?: string[] },
+  ): void {
+    const now = this.now();
+    const next: DeterministicRequirement = {
+      ...input,
+      evidenceIds: input.evidenceIds ?? [],
+      createdAt: now,
+      updatedAt: now,
+    };
+    const existing = this.snapshotValue.taskState.deterministicRequirements;
+    const index = existing.findIndex(
+      (record) => record.requirementId === input.requirementId,
+    );
+    const deterministicRequirements =
+      index === -1
+        ? [...existing, next]
+        : existing.map((record, i) =>
+            i === index
+              ? {
+                  ...record,
+                  ...input,
+                  evidenceIds: input.evidenceIds ?? record.evidenceIds,
+                  updatedAt: now,
+                }
+              : record,
+          );
+    this.patchTaskState({ deterministicRequirements });
+  }
+
+  recordDeterministicEvidence(
+    input: Omit<DeterministicEvidenceRecord, "recordedAt">,
+  ): void {
+    const now = this.now();
+    const existing = this.snapshotValue.taskState.deterministicEvidence;
+    const record: DeterministicEvidenceRecord = {
+      ...input,
+      recordedAt: now,
+    };
+    const duplicate = existing.some(
+      (item) => item.evidenceId === record.evidenceId,
+    );
+    const deterministicEvidence = duplicate ? existing : [...existing, record];
+    const passedRequirementIds =
+      record.status === "passed" ? new Set(record.requirementIds) : new Set<string>();
+    const deterministicRequirements =
+      passedRequirementIds.size === 0
+        ? this.snapshotValue.taskState.deterministicRequirements
+        : this.snapshotValue.taskState.deterministicRequirements.map((requirement) => {
+            if (!passedRequirementIds.has(requirement.requirementId)) {
+              return requirement;
+            }
+            const evidenceIds = requirement.evidenceIds.includes(record.evidenceId)
+              ? requirement.evidenceIds
+              : [...requirement.evidenceIds, record.evidenceId];
+            return {
+              ...requirement,
+              status: "satisfied" as const,
+              evidenceIds,
+              updatedAt: now,
+            };
+          });
+    this.patchTaskState({
+      deterministicEvidence,
+      deterministicRequirements,
+    });
+  }
+
   unmetRequiredCriteria(): AcceptanceCriterion[] {
     return this.snapshotValue.taskState.criteria.filter(
       (criterion) =>
@@ -292,6 +424,34 @@ export function renderExecutionContractBlock(
     renderList("blockers", task.blockers),
     renderList("acceptance_criteria", task.acceptanceCriteria),
     renderResourceBindingsBlock(task.resourceBindings),
+    renderList(
+      "deterministic_requirements",
+      task.deterministicRequirements.map((requirement) =>
+        [
+          requirement.requirementId,
+          requirement.turnId,
+          requirement.status,
+          requirement.kinds.join(","),
+          requirement.reason,
+          requirement.suggestedTools.length > 0
+            ? `tools=${requirement.suggestedTools.join(",")}`
+            : "",
+        ].filter(Boolean).join(" | "),
+      ),
+    ),
+    renderList(
+      "deterministic_evidence",
+      task.deterministicEvidence.map((evidence) =>
+        [
+          evidence.evidenceId,
+          evidence.turnId,
+          evidence.status,
+          evidence.kind,
+          evidence.toolName,
+          evidence.inputSummary,
+        ].filter(Boolean).join(" | "),
+      ),
+    ),
     renderList(
       "verification_evidence",
       task.verificationEvidence.map((e) =>
@@ -341,7 +501,13 @@ export function completionClaimMissingCriteria(
 export function shouldInjectExecutionContract(
   snapshot: ExecutionContractSnapshot,
 ): boolean {
-  return snapshot.control.mode === "heavy";
+  return (
+    snapshot.control.mode === "heavy" ||
+    snapshot.taskState.deterministicRequirements.some(
+      (requirement) =>
+        requirement.status === "active" || requirement.status === "satisfied",
+    )
+  );
 }
 
 export function classifyExecutionControl(

@@ -8,6 +8,7 @@
  */
 
 import type { Workspace } from "./storage/Workspace.js";
+import type { ExecutionContractStore } from "./execution/ExecutionContract.js";
 
 export type PermissionClass = "read" | "write" | "execute" | "net" | "meta";
 
@@ -60,6 +61,8 @@ export interface ToolContext {
   abortSignal: AbortSignal;
   /** Per-turn staging surface — tools write here, not to disk directly. */
   staging: StagingSurface;
+  /** Active first-class execution contract for tools that produce evidence. */
+  executionContract?: ExecutionContractStore;
   /**
    * Spawn depth — 0 for a top-level turn, 1 for a direct child spawned
    * via SpawnAgent, 2 for a grandchild. `MAX_SPAWN_DEPTH` enforced by

@@ -35,6 +35,32 @@ describe("VerificationEvidence", () => {
     ).toMatchObject({ verification: true, documentVerification: true });
   });
 
+  it("treats native web tools as same-turn verification evidence for source-sensitive claims", () => {
+    expect(
+      classifyEvidence([
+        { tool: "WebSearch", input: { query: "latest pricing" }, status: "ok" },
+      ]),
+    ).toMatchObject({ verification: true });
+    expect(
+      shouldBlockClaim("검색해서 확인했습니다.", [
+        { tool: "WebFetch", input: { url: "https://example.com" }, status: "ok" },
+      ]),
+    ).toBe(false);
+  });
+
+  it("treats native deterministic tools as verification evidence for exactness claims", () => {
+    expect(
+      classifyEvidence([
+        { tool: "Clock", input: { timezone: "Asia/Seoul" }, status: "ok" },
+        {
+          tool: "Calculation",
+          input: { operation: "average", field: "revenue" },
+          status: "ok",
+        },
+      ]),
+    ).toMatchObject({ verification: true });
+  });
+
   it("builds same-turn evidence from transcript tool calls/results", () => {
     const transcript: TranscriptEntry[] = [
       {

@@ -37,6 +37,8 @@ const DEFAULT_POLICY: RuntimePolicy = {
 
 const DIRECTIVE_LINE_PREFIX_RE = /^\s*(?:[-*+]\s+|\d+[.)]\s+)?/;
 const MARKDOWN_HEADING_RE = /^\s*#+\s+/;
+const MAX_REGEX_PATTERN_CHARS = 300;
+const MAX_INPUT_PATH_CHARS = 120;
 
 function cloneDefaultPolicy(): RuntimePolicy {
   return {
@@ -141,10 +143,15 @@ function buildUserDirectives(policy: RuntimePolicy): string[] {
 }
 
 function harnessDirective(rule: HarnessRule): string {
-  const action =
-    rule.action.type === "require_tool"
-      ? `require_tool ${rule.action.toolName}`
-      : rule.action.type;
+  const action = (() => {
+    if (rule.action.type === "require_tool") {
+      return `require_tool ${rule.action.toolName}`;
+    }
+    if (rule.action.type === "require_tool_input_match") {
+      return `require_tool_input_match ${rule.action.toolName} ${rule.action.inputPath}`;
+    }
+    return rule.action.type;
+  })();
   return `${rule.id} ${rule.trigger} ${action} ${rule.enforcement}`;
 }
 
@@ -161,6 +168,33 @@ function makeVerifierAction(prompt: string): HarnessRuleAction {
     type: "llm_verifier",
     prompt: prompt.slice(0, 1200),
   };
+}
+
+function nonEmptyString(value: unknown): string | null {
+  return typeof value === "string" && value.trim().length > 0
+    ? value.trim()
+    : null;
+}
+
+function validateRegexPattern(pattern: string, label: string): string | null {
+  if (pattern.length > MAX_REGEX_PATTERN_CHARS) {
+    return `${label} regex is too long`;
+  }
+  if (/\\[1-9]/.test(pattern)) {
+    return `${label} regex uses unsupported backreferences`;
+  }
+  if (/\(\?<?[=!]/.test(pattern)) {
+    return `${label} regex uses unsupported lookaround`;
+  }
+  if (/\([^)]*(?:[+*]|\{\d*,?\d*\})[^)]*\)\s*(?:[+*]|\{\d*,?\d*\})/.test(pattern)) {
+    return `${label} regex is too complex`;
+  }
+  try {
+    new RegExp(pattern, "iu");
+  } catch {
+    return `${label} regex is invalid`;
+  }
+  return null;
 }
 
 function compileHarnessRule(line: string): HarnessRule | null {
@@ -263,7 +297,11 @@ function stringArray(value: unknown): string[] | undefined {
   return out.length > 0 ? out : undefined;
 }
 
-function parseCondition(value: unknown): HarnessRuleCondition | undefined {
+function parseCondition(
+  value: unknown,
+  warnings: string[],
+  sourcePath: string,
+): HarnessRuleCondition | undefined {
   if (!value || typeof value !== "object" || Array.isArray(value)) return undefined;
   const data = value as Record<string, unknown>;
   const condition: HarnessRuleCondition = {};
@@ -274,17 +312,56 @@ function parseCondition(value: unknown): HarnessRuleCondition | undefined {
   if (anyToolUsed) condition.anyToolUsed = anyToolUsed;
   const userMessageIncludes = stringArray(data.userMessageIncludes);
   if (userMessageIncludes) condition.userMessageIncludes = userMessageIncludes;
+  const userMessageMatches = nonEmptyString(
+    data.userMessageMatches ?? data.user_message_matches,
+  );
+  if (userMessageMatches) {
+    const warning = validateRegexPattern(userMessageMatches, "userMessageMatches");
+    if (warning) {
+      warnings.push(`harness rule ${sourcePath} ignored userMessageMatches: ${warning}`);
+    } else {
+      condition.userMessageMatches = userMessageMatches;
+    }
+  }
   return Object.keys(condition).length > 0 ? condition : undefined;
 }
 
 function parseAction(
   value: unknown,
   body: string,
+  warnings: string[],
+  sourcePath: string,
 ): HarnessRuleAction | null {
   if (!value || typeof value !== "object" || Array.isArray(value)) return null;
   const data = value as Record<string, unknown>;
   if (data.type === "require_tool" && typeof data.toolName === "string") {
     return { type: "require_tool", toolName: data.toolName };
+  }
+  if (data.type === "require_tool_input_match") {
+    const toolName = nonEmptyString(data.toolName ?? data.tool_name ?? data.tool);
+    const commandPattern = nonEmptyString(
+      data.inputCommandMatches ?? data.input_command_matches,
+    );
+    const inputPath = nonEmptyString(data.inputPath ?? data.input_path) ??
+      (commandPattern ? "command" : null);
+    const pattern = nonEmptyString(data.pattern ?? data.inputMatches ?? data.input_matches) ??
+      commandPattern;
+    if (!toolName || !inputPath || !pattern) return null;
+    if (inputPath.length > MAX_INPUT_PATH_CHARS) {
+      warnings.push(`harness rule ${sourcePath} ignored: inputPath is too long`);
+      return null;
+    }
+    const warning = validateRegexPattern(pattern, "input match");
+    if (warning) {
+      warnings.push(`harness rule ${sourcePath} ignored: ${warning}`);
+      return null;
+    }
+    return {
+      type: "require_tool_input_match",
+      toolName,
+      inputPath,
+      pattern,
+    };
   }
   if (data.type === "llm_verifier") {
     const prompt =
@@ -339,7 +416,7 @@ function compileStructuredHarnessRule(
     warnings.push(`harness rule ${id} ignored: invalid trigger`);
     return null;
   }
-  const action = parseAction(data.action, body);
+  const action = parseAction(data.action, body, warnings, sourcePath);
   if (!action) {
     warnings.push(`harness rule ${id} ignored: invalid action`);
     return null;
@@ -363,7 +440,7 @@ function compileStructuredHarnessRule(
     sourceText,
     enabled: typeof data.enabled === "boolean" ? data.enabled : true,
     trigger: data.trigger,
-    condition: parseCondition(data.condition),
+    condition: parseCondition(data.condition, warnings, sourcePath),
     action,
     enforcement,
     timeoutMs,

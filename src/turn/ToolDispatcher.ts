@@ -353,6 +353,7 @@ async function dispatchOne(
     turnId,
     workspaceRoot: session.agent.config.workspaceRoot,
     abortSignal: abortController.signal,
+    executionContract: session.executionContract,
     emitProgress: (p) => {
       sse.agent({ type: "tool_start", id: tu.id, name: p.label });
     },

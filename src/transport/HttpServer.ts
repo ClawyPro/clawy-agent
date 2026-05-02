@@ -27,6 +27,7 @@ import { turnsRoutes } from "./routes/turns.js";
 import { mcpRoutes } from "./routes/mcp.js";
 import { heartbeatRoutes } from "./routes/heartbeat.js";
 import { parityRoutes } from "./routes/parity.js";
+import { skillsRoutes } from "./routes/skills.js";
 
 export interface HttpServerOptions {
   port: number;
@@ -95,6 +96,7 @@ export class HttpServer {
       ...parityRoutes,
       ...mcpRoutes,
       ...heartbeatRoutes,
+      ...skillsRoutes,
     ];
   }
 

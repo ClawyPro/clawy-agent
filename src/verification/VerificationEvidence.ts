@@ -74,6 +74,17 @@ const EXPLICIT_VERIFIER_TOOLS = new Set([
   "Verification",
   "VerificationResult",
   "ArtifactVerify",
+  "Clock",
+  "DateRange",
+  "Calculation",
+  "DeterministicEvidenceVerifier",
+]);
+
+const SOURCE_VERIFICATION_TOOLS = new Set([
+  "WebFetch",
+  "WebSearch",
+  "web-search",
+  "web_search",
 ]);
 
 export function matchesCompletionClaim(text: string): boolean {
@@ -107,11 +118,12 @@ export function classifyEvidence(
     const commandVerifies = command.length > 0 && isVerificationCommand(command);
     const documentToolVerifies = DOCUMENT_VERIFICATION_TOOLS.has(item.tool);
     const explicitVerifier = EXPLICIT_VERIFIER_TOOLS.has(item.tool);
+    const sourceVerifier = SOURCE_VERIFICATION_TOOLS.has(item.tool);
 
     if (WORK_EVIDENCE_TOOLS.has(item.tool) && !commandVerifies) {
       work = true;
     }
-    if (commandVerifies || documentToolVerifies || explicitVerifier) {
+    if (commandVerifies || documentToolVerifies || explicitVerifier || sourceVerifier) {
       verification = true;
       if (command.length > 0) verificationCommands.push(command);
     }

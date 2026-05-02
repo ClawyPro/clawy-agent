@@ -62,19 +62,76 @@ function successfulToolNames(
   transcript: ReadonlyArray<TranscriptEntry>,
   turnId: string,
 ): Set<string> {
+  return new Set(
+    successfulToolCalls(transcript, turnId).map((entry) => entry.name),
+  );
+}
+
+function successfulToolCalls(
+  transcript: ReadonlyArray<TranscriptEntry>,
+  turnId: string,
+): Extract<TranscriptEntry, { kind: "tool_call" }>[] {
   const successfulIds = new Set<string>();
   for (const entry of transcript) {
     if (entry.turnId !== turnId) continue;
     if (isSuccessfulResult(entry)) successfulIds.add(entry.toolUseId);
   }
 
-  const names = new Set<string>();
+  const calls: Extract<TranscriptEntry, { kind: "tool_call" }>[] = [];
   for (const entry of transcript) {
     if (entry.turnId !== turnId) continue;
     if (entry.kind !== "tool_call") continue;
-    if (successfulIds.has(entry.toolUseId)) names.add(entry.name);
+    if (successfulIds.has(entry.toolUseId)) calls.push(entry);
   }
-  return names;
+  return calls;
+}
+
+function regexMatches(pattern: string, text: string): boolean {
+  try {
+    return new RegExp(pattern, "iu").test(text);
+  } catch {
+    return false;
+  }
+}
+
+function valueAtInputPath(input: unknown, inputPath: string): unknown {
+  const segments = inputPath
+    .split(".")
+    .map((segment) => segment.trim())
+    .filter((segment) => segment.length > 0);
+  let current = input;
+  for (const segment of segments) {
+    if (typeof current !== "object" || current === null) return undefined;
+    if (!Object.prototype.hasOwnProperty.call(current, segment)) return undefined;
+    current = (current as Record<string, unknown>)[segment];
+  }
+  return current;
+}
+
+function inputValueAsText(value: unknown): string {
+  if (typeof value === "string") return value;
+  if (value === undefined || value === null) return "";
+  try {
+    return JSON.stringify(value);
+  } catch {
+    return String(value);
+  }
+}
+
+function hasSuccessfulToolInputMatch(
+  transcript: ReadonlyArray<TranscriptEntry>,
+  turnId: string,
+  args: {
+    toolName: string;
+    inputPath: string;
+    pattern: string;
+  },
+): boolean {
+  return successfulToolCalls(transcript, turnId).some((entry) => {
+    if (entry.name !== args.toolName) return false;
+    const value = valueAtInputPath(entry.input, args.inputPath);
+    return regexMatches(args.pattern, inputValueAsText(value));
+  });
 }
 
 function conditionMatchesBeforeCommit(
@@ -97,6 +154,12 @@ function conditionMatchesBeforeCommit(
     ) {
       return false;
     }
+  }
+  if (
+    condition.userMessageMatches &&
+    !regexMatches(condition.userMessageMatches, args.userMessage)
+  ) {
+    return false;
   }
 
   const tools = successfulToolNames(transcript, turnId);
@@ -229,6 +292,20 @@ async function evaluateBeforeCommitRule(
       detail: pass
         ? `${rule.action.toolName} succeeded in this turn`
         : `required tool ${rule.action.toolName} did not succeed in this turn`,
+    };
+  }
+
+  if (rule.action.type === "require_tool_input_match") {
+    const pass = hasSuccessfulToolInputMatch(transcript, ctx.turnId, {
+      toolName: rule.action.toolName,
+      inputPath: rule.action.inputPath,
+      pattern: rule.action.pattern,
+    });
+    return {
+      pass,
+      detail: pass
+        ? `${rule.action.toolName} input ${rule.action.inputPath} matched in this turn`
+        : `required ${rule.action.toolName} input ${rule.action.inputPath} matching ${rule.action.pattern} did not succeed in this turn`,
     };
   }
 

@@ -39,17 +39,23 @@ function successfulTool(
   toolUseId: string,
   input: unknown = {},
   output = "{}",
+  opts: {
+    turnId?: string;
+    status?: string;
+    isError?: boolean;
+  } = {},
 ): TranscriptEntry[] {
+  const turnId = opts.turnId ?? "turn";
   return [
-    { kind: "tool_call", ts: 1, turnId: "turn", toolUseId, name, input },
+    { kind: "tool_call", ts: 1, turnId, toolUseId, name, input },
     {
       kind: "tool_result",
       ts: 2,
-      turnId: "turn",
+      turnId,
       toolUseId,
-      status: "ok",
+      status: opts.status ?? "ok",
       output,
-      isError: false,
+      isError: opts.isError ?? false,
     },
   ];
 }
@@ -269,5 +275,247 @@ describe("userHarnessRules", () => {
         verdict: "violation",
       }),
     );
+  });
+
+  it("blocks beforeCommit when a required tool input match is missing", async () => {
+    const transcript: TranscriptEntry[] = [];
+    const hooks = makeUserHarnessRuleHooks({
+      policy: {
+        current: async () =>
+          makeSnapshot([
+            {
+              id: "tossplace-merchant-grounding",
+              sourceText: "Toss POS connection status must be grounded",
+              enabled: true,
+              trigger: "beforeCommit",
+              condition: {
+                userMessageMatches:
+                  "(토스|토스플레이스|POS).*(연결|연동|해제|등록|매장)",
+              },
+              action: {
+                type: "require_tool_input_match",
+                toolName: "Bash",
+                inputPath: "command",
+                pattern: "integration\\.sh\\s+[\"']?tossplace/my-merchants",
+              },
+              enforcement: "block_on_fail",
+              timeoutMs: 2_000,
+            },
+          ]),
+      },
+      agent: { readSessionTranscript: async () => transcript },
+    });
+
+    const out = await hooks.beforeCommit.handler(
+      {
+        assistantText: "새 세션이라 연결 상태가 reset됐습니다.",
+        toolCallCount: 0,
+        toolReadHappened: false,
+        userMessage: "토스 연결이 해제된거야?",
+        retryCount: 0,
+        filesChanged: [],
+      },
+      makeCtx(transcript),
+    );
+
+    expect(out).toMatchObject({ action: "block" });
+    expect(out && "reason" in out ? out.reason : "").toContain(
+      "required Bash input command matching",
+    );
+  });
+
+  it("continues when the required tool input match succeeded in the same turn", async () => {
+    const transcript = successfulTool("Bash", "tu_bash", {
+      command: 'integration.sh "tossplace/my-merchants"',
+    });
+    const hooks = makeUserHarnessRuleHooks({
+      policy: {
+        current: async () =>
+          makeSnapshot([
+            {
+              id: "tossplace-merchant-grounding",
+              sourceText: "Toss POS connection status must be grounded",
+              enabled: true,
+              trigger: "beforeCommit",
+              condition: {
+                userMessageMatches:
+                  "(토스|토스플레이스|POS).*(연결|연동|해제|등록|매장)",
+              },
+              action: {
+                type: "require_tool_input_match",
+                toolName: "Bash",
+                inputPath: "command",
+                pattern: "integration\\.sh\\s+[\"']?tossplace/my-merchants",
+              },
+              enforcement: "block_on_fail",
+              timeoutMs: 2_000,
+            },
+          ]),
+      },
+      agent: { readSessionTranscript: async () => transcript },
+    });
+
+    const out = await hooks.beforeCommit.handler(
+      {
+        assistantText: "두 매장이 연결되어 있습니다.",
+        toolCallCount: 1,
+        toolReadHappened: false,
+        userMessage: "토스 POS 매장 연결 상태 알려줘",
+        retryCount: 0,
+        filesChanged: [],
+      },
+      makeCtx(transcript),
+    );
+
+    expect(out).toEqual({ action: "continue" });
+  });
+
+  it("does not accept a different endpoint for required tool input match", async () => {
+    const transcript = successfulTool("Bash", "tu_bash", {
+      command: 'integration.sh "tossplace/sales-summary?merchantId=210391"',
+    });
+    const hooks = makeUserHarnessRuleHooks({
+      policy: {
+        current: async () =>
+          makeSnapshot([
+            {
+              id: "tossplace-merchant-grounding",
+              sourceText: "Toss POS connection status must be grounded",
+              enabled: true,
+              trigger: "beforeCommit",
+              condition: {
+                userMessageMatches:
+                  "(토스|토스플레이스|POS).*(연결|연동|해제|등록|매장)",
+              },
+              action: {
+                type: "require_tool_input_match",
+                toolName: "Bash",
+                inputPath: "command",
+                pattern: "integration\\.sh\\s+[\"']?tossplace/my-merchants",
+              },
+              enforcement: "block_on_fail",
+              timeoutMs: 2_000,
+            },
+          ]),
+      },
+      agent: { readSessionTranscript: async () => transcript },
+    });
+
+    const out = await hooks.beforeCommit.handler(
+      {
+        assistantText: "매장 연결 상태입니다.",
+        toolCallCount: 1,
+        toolReadHappened: false,
+        userMessage: "POS 연동 상태 알려줘",
+        retryCount: 0,
+        filesChanged: [],
+      },
+      makeCtx(transcript),
+    );
+
+    expect(out).toMatchObject({ action: "block" });
+  });
+
+  it("skips required tool input match when user message regex does not match", async () => {
+    const transcript: TranscriptEntry[] = [];
+    const hooks = makeUserHarnessRuleHooks({
+      policy: {
+        current: async () =>
+          makeSnapshot([
+            {
+              id: "tossplace-merchant-grounding",
+              sourceText: "Toss POS connection status must be grounded",
+              enabled: true,
+              trigger: "beforeCommit",
+              condition: {
+                userMessageMatches:
+                  "(토스|토스플레이스|POS).*(연결|연동|해제|등록|매장)",
+              },
+              action: {
+                type: "require_tool_input_match",
+                toolName: "Bash",
+                inputPath: "command",
+                pattern: "integration\\.sh\\s+[\"']?tossplace/my-merchants",
+              },
+              enforcement: "block_on_fail",
+              timeoutMs: 2_000,
+            },
+          ]),
+      },
+      agent: { readSessionTranscript: async () => transcript },
+    });
+
+    const out = await hooks.beforeCommit.handler(
+      {
+        assistantText: "오늘 날씨는 확인할 수 없습니다.",
+        toolCallCount: 0,
+        toolReadHappened: false,
+        userMessage: "오늘 날씨 어때?",
+        retryCount: 0,
+        filesChanged: [],
+      },
+      makeCtx(transcript),
+    );
+
+    expect(out).toEqual({ action: "continue" });
+  });
+
+  it("does not accept failed or previous-turn tool input matches", async () => {
+    const transcript = [
+      ...successfulTool(
+        "Bash",
+        "tu_old",
+        { command: 'integration.sh "tossplace/my-merchants"' },
+        "{}",
+        { turnId: "previous-turn" },
+      ),
+      ...successfulTool(
+        "Bash",
+        "tu_failed",
+        { command: 'integration.sh "tossplace/my-merchants"' },
+        "{}",
+        { status: "error", isError: true },
+      ),
+    ];
+    const hooks = makeUserHarnessRuleHooks({
+      policy: {
+        current: async () =>
+          makeSnapshot([
+            {
+              id: "tossplace-merchant-grounding",
+              sourceText: "Toss POS connection status must be grounded",
+              enabled: true,
+              trigger: "beforeCommit",
+              condition: {
+                userMessageMatches:
+                  "(토스|토스플레이스|POS).*(연결|연동|해제|등록|매장)",
+              },
+              action: {
+                type: "require_tool_input_match",
+                toolName: "Bash",
+                inputPath: "command",
+                pattern: "integration\\.sh\\s+[\"']?tossplace/my-merchants",
+              },
+              enforcement: "block_on_fail",
+              timeoutMs: 2_000,
+            },
+          ]),
+      },
+      agent: { readSessionTranscript: async () => transcript },
+    });
+
+    const out = await hooks.beforeCommit.handler(
+      {
+        assistantText: "두 매장이 연결되어 있습니다.",
+        toolCallCount: 1,
+        toolReadHappened: false,
+        userMessage: "토스 매장 등록 상태 알려줘",
+        retryCount: 0,
+        filesChanged: [],
+      },
+      makeCtx(transcript),
+    );
+
+    expect(out).toMatchObject({ action: "block" });
   });
 });

@@ -434,6 +434,48 @@ describe("Turn.execute() stop-reason taxonomy", () => {
     expect(turn.meta.stopReason).toBe("end_turn");
   });
 
+  it("does not treat a long complete answer ending with an emoji as truncated", async () => {
+    const answer =
+      "접속 실패 원인과 확인 방법을 정리했습니다.\n\n" +
+      "가능한 원인\n" +
+      "1. 서버 프로세스가 중단된 상태일 수 있습니다.\n" +
+      "2. 배포 과정에서 포트가 바뀌었을 수 있습니다.\n" +
+      "3. 방화벽이나 보안그룹에서 외부 접근이 막혔을 수 있습니다.\n" +
+      "4. 베타 프로세스가 크래시 후 자동 복구되지 않았을 수 있습니다.\n\n" +
+      "서버에서 `netstat -tlnp | grep 18427` 또는 `docker ps`로 상태를 확인해주시고, " +
+      "서비스를 다시 올린 뒤 알려주시면 이어서 UX와 보안 관점까지 점검하겠습니다. 🔧";
+    const { turn, llm } = await makeFixture([
+      { blocks: [{ type: "text", text: answer }], stopReason: "end_turn" },
+      { blocks: [{ type: "text", text: "이전 응답은 잘리지 않았습니다. 핵심 내용을 다시 정리드리면..." }], stopReason: "end_turn" },
+    ]);
+
+    await turn.execute();
+    const commit = await turn.commit();
+
+    expect(llm.calls.length).toBe(1);
+    expect(commit.finalText).toBe(answer);
+  });
+
+  it("continues a long answer that appears to end mid-sentence", async () => {
+    const partial =
+      "긴 분석을 작성하는 중입니다. ".repeat(12) +
+      "마지막으로 서버 프로세스가 계속 내려가는 경우에는 배포 로그와 런타임 로그를 함께 확인해야 하며 원인은";
+    const continuation = " 프로세스 크래시 또는 포트 바인딩 실패일 가능성이 큽니다.";
+    const { turn, llm } = await makeFixture([
+      { blocks: [{ type: "text", text: partial }], stopReason: "end_turn" },
+      { blocks: [{ type: "text", text: continuation }], stopReason: "end_turn" },
+    ]);
+
+    await turn.execute();
+    const commit = await turn.commit();
+
+    expect(llm.calls.length).toBe(2);
+    expect(llm.calls[1]?.messages.at(-1)?.content).toBe(
+      "Your response was cut off mid-sentence. Continue from where you left off.",
+    );
+    expect(commit.finalText).toBe(partial + continuation);
+  });
+
   it("tool_use → runs tools then terminates on end_turn", async () => {
     const { turn, llm, toolCalls } = await makeFixture(
       [

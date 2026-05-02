@@ -40,12 +40,19 @@ export interface HarnessRuleCondition {
   toolName?: string;
   anyToolUsed?: string[];
   userMessageIncludes?: string[];
+  userMessageMatches?: string;
 }
 
 export type HarnessRuleAction =
   | {
       type: "require_tool";
       toolName: string;
+    }
+  | {
+      type: "require_tool_input_match";
+      toolName: string;
+      inputPath: string;
+      pattern: string;
     }
   | {
       type: "llm_verifier";
