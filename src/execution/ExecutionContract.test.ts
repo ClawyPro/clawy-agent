@@ -180,6 +180,100 @@ describe("ExecutionContractStore", () => {
     ]);
   });
 
+  it("records LLM-classified deterministic requirements as first-class state", () => {
+    const store = new ExecutionContractStore({ now: () => 2000 });
+
+    store.recordDeterministicRequirement({
+      requirementId: "dr_1",
+      source: "llm_classifier",
+      status: "active",
+      kinds: ["date_range", "calculation"],
+      reason: "User asks for an average over the recent 30-day sales period.",
+      suggestedTools: ["Clock", "DateRange", "Calculation"],
+      acceptanceCriteria: [
+        "Determine the date range with runtime clock evidence.",
+        "Calculate the average with deterministic calculation evidence.",
+      ],
+    });
+
+    expect(store.snapshot().taskState.deterministicRequirements).toEqual([
+      {
+        requirementId: "dr_1",
+        source: "llm_classifier",
+        status: "active",
+        kinds: ["date_range", "calculation"],
+        reason: "User asks for an average over the recent 30-day sales period.",
+        suggestedTools: ["Clock", "DateRange", "Calculation"],
+        acceptanceCriteria: [
+          "Determine the date range with runtime clock evidence.",
+          "Calculate the average with deterministic calculation evidence.",
+        ],
+        evidenceIds: [],
+        createdAt: 2000,
+        updatedAt: 2000,
+      },
+    ]);
+  });
+
+  it("records deterministic evidence and marks the linked requirement satisfied", () => {
+    const store = new ExecutionContractStore({ now: () => 3000 });
+    store.recordDeterministicRequirement({
+      requirementId: "dr_1",
+      source: "llm_classifier",
+      status: "active",
+      kinds: ["calculation"],
+      reason: "Need exact average.",
+      suggestedTools: ["Calculation"],
+      acceptanceCriteria: [],
+    });
+
+    store.recordDeterministicEvidence({
+      evidenceId: "de_1",
+      requirementIds: ["dr_1"],
+      toolName: "Calculation",
+      toolUseId: "tu_1",
+      kind: "calculation",
+      status: "passed",
+      inputSummary: "average amount over 3 rows",
+      output: {
+        operation: "average",
+        field: "amount",
+        result: 20,
+        rowCount: 3,
+      },
+      assertions: ["rowCount=3", "sum=60", "average=20"],
+      resources: ["workspace:data/sales.csv"],
+    });
+
+    const snapshot = store.snapshot();
+    expect(snapshot.taskState.deterministicEvidence).toEqual([
+      {
+        evidenceId: "de_1",
+        requirementIds: ["dr_1"],
+        toolName: "Calculation",
+        toolUseId: "tu_1",
+        kind: "calculation",
+        status: "passed",
+        inputSummary: "average amount over 3 rows",
+        output: {
+          operation: "average",
+          field: "amount",
+          result: 20,
+          rowCount: 3,
+        },
+        assertions: ["rowCount=3", "sum=60", "average=20"],
+        resources: ["workspace:data/sales.csv"],
+        recordedAt: 3000,
+      },
+    ]);
+    expect(snapshot.taskState.deterministicRequirements[0]).toMatchObject({
+      requirementId: "dr_1",
+      status: "satisfied",
+      evidenceIds: ["de_1"],
+      updatedAt: 3000,
+    });
+  });
+
   it("keeps simple file understanding turns on the light path", () => {
     const store = new ExecutionContractStore({ now: () => 789 });
 

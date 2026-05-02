@@ -52,6 +52,28 @@ function emptyResponseFallbackModel(): string | null {
   return raw && raw.length > 0 ? raw : DEFAULT_EMPTY_RESPONSE_FALLBACK_MODEL;
 }
 
+function truncationGuardEnding(text: string): {
+  readonly looksTruncated: boolean;
+  readonly lastChar: string;
+} {
+  const trimmed = text.trimEnd().replace(/[\uFE0E\uFE0F]+$/u, "");
+  const chars = Array.from(trimmed);
+  const lastChar = chars.at(-1) ?? "";
+  if (trimmed.length <= 200) return { looksTruncated: false, lastChar };
+
+  // Terminal punctuation or a deliberate trailing symbol/emoji usually
+  // means the answer is complete even if it does not end in ".".
+  const terminalRe = /[.!?。！？…\n\r)）」』】\]}'"`]$/u;
+  if (
+    terminalRe.test(lastChar) ||
+    /\p{Extended_Pictographic}/u.test(lastChar) ||
+    /\p{Symbol}/u.test(lastChar)
+  ) {
+    return { looksTruncated: false, lastChar };
+  }
+  return { looksTruncated: true, lastChar };
+}
+
 export class TurnInterruptedError extends Error {
   readonly handoffRequested: boolean;
   readonly source: string;
@@ -451,14 +473,10 @@ export class Turn {
               .reverse()
               .find((b) => b.type === "text") as { text: string } | undefined;
             const lastText = lastTextBlock?.text?.trimEnd() ?? "";
-            const lastChar = lastText.slice(-1);
-            // Terminal punctuation signals a complete sentence.
-            const TERMINAL_RE = /[.!?。！？…\n\r)）」』】]$/;
-            // Skip guard if response is very short (likely intentional)
-            // or already ends with terminal punctuation.
-            if (lastText.length > 200 && !TERMINAL_RE.test(lastChar)) {
+            const ending = truncationGuardEnding(lastText);
+            if (ending.looksTruncated) {
               console.log(
-                `[core-agent] truncation-guard fired: lastChar=${JSON.stringify(lastChar)}` +
+                `[core-agent] truncation-guard fired: lastChar=${JSON.stringify(ending.lastChar)}` +
                 ` textLen=${lastText.length} retry=${this.truncationRecovery}`,
               );
               if (finalBlocks.length > 0) {

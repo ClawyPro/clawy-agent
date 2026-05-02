@@ -16,6 +16,7 @@ export class ToolRegistry implements IToolRegistry {
   private readonly tools = new Map<string, Tool>();
   /** Last loadSkills() result — exposed via /healthz. */
   private lastSkillReport: SkillLoadReport | null = null;
+  private readonly loadedSkillToolNames = new Set<string>();
 
   register(tool: Tool): void {
     if (this.tools.has(tool.name)) {
@@ -50,6 +51,14 @@ export class ToolRegistry implements IToolRegistry {
       trustedSkillDirs?: readonly string[];
     } = {},
   ): Promise<number> {
+    for (const name of this.loadedSkillToolNames) {
+      const current = this.tools.get(name);
+      if (current?.kind === "skill") {
+        this.tools.delete(name);
+      }
+    }
+    this.loadedSkillToolNames.clear();
+
     const { tools, report } = await loadSkillsFromDir({
       skillsDir,
       workspaceRoot: workspaceRoot ?? skillsDir,
@@ -60,6 +69,7 @@ export class ToolRegistry implements IToolRegistry {
       // Skills can overlap with bot-native tool names — skills win on
       // conflict (bot author's intent).
       this.tools.set(t.name, t);
+      this.loadedSkillToolNames.add(t.name);
     }
     this.lastSkillReport = report;
     return tools.length;

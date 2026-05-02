@@ -103,6 +103,8 @@ import {
   makeExecutionContractPromptHook,
   makeExecutionContractVerifierHook,
 } from "./executionContract.js";
+import { makeDeterministicExactnessHook } from "./deterministicExactness.js";
+import { makeDeterministicEvidenceVerifierHook } from "./deterministicEvidenceVerifier.js";
 import {
   makeResourceBoundaryHooks,
   type ResourceBoundaryAgent,
@@ -308,6 +310,12 @@ export function registerBuiltinHooks(
   const reliabilityPromptHook = makeReliabilityPromptInjectorHook();
   if (maybe(reliabilityPromptHook.name)) {
     registry.register(reliabilityPromptHook);
+    registered++;
+  }
+
+  const deterministicExactnessHook = makeDeterministicExactnessHook();
+  if (maybe(deterministicExactnessHook.name)) {
+    registry.register(deterministicExactnessHook);
     registered++;
   }
 
@@ -603,6 +611,12 @@ export function registerBuiltinHooks(
   });
   if (maybe(taskContractGateHook.name)) {
     registry.register(taskContractGateHook);
+    registered++;
+  }
+
+  const deterministicEvidenceVerifierHook = makeDeterministicEvidenceVerifierHook();
+  if (maybe(deterministicEvidenceVerifierHook.name)) {
+    registry.register(deterministicEvidenceVerifierHook);
     registered++;
   }
 

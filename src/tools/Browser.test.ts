@@ -6,6 +6,7 @@ import type { ToolContext } from "../Tool.js";
 import { makeBrowserTool, type BrowserRunner } from "./Browser.js";
 
 const roots: string[] = [];
+const resolvePublicHost = async () => [{ address: "93.184.216.34", family: 4 as const }];
 
 async function makeRoot(): Promise<string> {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), "browser-tool-"));
@@ -62,7 +63,7 @@ describe("Browser", () => {
         truncated: false,
       };
     };
-    const tool = makeBrowserTool(root, { runner });
+    const tool = makeBrowserTool(root, { runner, resolveHost: resolvePublicHost });
     const ctx = makeCtx(root);
 
     const create = await tool.execute({ action: "create_session" }, ctx);
@@ -106,11 +107,132 @@ describe("Browser", () => {
         truncated: false,
       };
     };
-    const tool = makeBrowserTool(root, { runner });
+    const tool = makeBrowserTool(root, { runner, resolveHost: resolvePublicHost });
     const ctx = makeCtx(root);
 
     await tool.execute({ action: "create_session" }, ctx);
     const result = await tool.execute({ action: "open", url: "javascript:alert(1)" }, ctx);
+
+    expect(result.status).toBe("error");
+    expect(result.errorCode).toBe("invalid_url");
+    expect(calls).toEqual([{ command: "integration.sh", args: ["browser/session-create"] }]);
+  });
+
+  it("rejects local, metadata, and cluster browser URLs before running agent-browser", async () => {
+    const root = await makeRoot();
+    const calls: Array<{ command: string; args: string[] }> = [];
+    const runner: BrowserRunner = async (command, args) => {
+      calls.push({ command, args });
+      if (command === "integration.sh") {
+        return {
+          exitCode: 0,
+          signal: null,
+          stdout: JSON.stringify({
+            sessionId: "sess-1",
+            cdpEndpoint: "ws://browser-worker:9222/devtools?token=t",
+          }),
+          stderr: "",
+          truncated: false,
+        };
+      }
+      return { exitCode: 0, signal: null, stdout: "opened", stderr: "", truncated: false };
+    };
+    const tool = makeBrowserTool(root, { runner, resolveHost: resolvePublicHost });
+    const ctx = makeCtx(root);
+
+    await tool.execute({ action: "create_session" }, ctx);
+
+    for (const url of [
+      "data:text/html,<h1>inline</h1>",
+      "http://localhost:3000",
+      "http://127.0.0.1:3000",
+      "http://169.254.169.254/latest/meta-data/",
+      "http://[::1]:3000",
+      "http://metadata.google.internal/computeMetadata/v1/",
+      "http://browser-worker:3003/health",
+      "http://browser-worker.clawy-system.svc.cluster.local:3003/health",
+    ]) {
+      const result = await tool.execute({ action: "open", url }, ctx);
+
+      expect(result.status).toBe("error");
+      expect(result.errorCode).toBe("invalid_url");
+    }
+    expect(calls).toEqual([{ command: "integration.sh", args: ["browser/session-create"] }]);
+  });
+
+  it("allows public raw IP URLs with custom ports", async () => {
+    const root = await makeRoot();
+    const calls: Array<{ command: string; args: string[] }> = [];
+    const runner: BrowserRunner = async (command, args) => {
+      calls.push({ command, args });
+      if (command === "integration.sh") {
+        return {
+          exitCode: 0,
+          signal: null,
+          stdout: JSON.stringify({
+            sessionId: "sess-1",
+            cdpEndpoint: "ws://browser-worker:9222/devtools?token=t",
+          }),
+          stderr: "",
+          truncated: false,
+        };
+      }
+      return { exitCode: 0, signal: null, stdout: "opened", stderr: "", truncated: false };
+    };
+    const tool = makeBrowserTool(root, { runner, resolveHost: resolvePublicHost });
+    const ctx = makeCtx(root);
+
+    await tool.execute({ action: "create_session" }, ctx);
+    const result = await tool.execute({ action: "open", url: "http://45.130.165.214:18427" }, ctx);
+
+    expect(result.status).toBe("ok");
+    expect(calls).toEqual([
+      { command: "integration.sh", args: ["browser/session-create"] },
+      {
+        command: "agent-browser",
+        args: [
+          "--cdp",
+          "ws://browser-worker:9222/devtools?token=t",
+          "open",
+          "http://45.130.165.214:18427",
+        ],
+      },
+    ]);
+  });
+
+  it("rejects hostnames that resolve to private addresses", async () => {
+    const root = await makeRoot();
+    const calls: Array<{ command: string; args: string[] }> = [];
+    const runner: BrowserRunner = async (command, args) => {
+      calls.push({ command, args });
+      if (command === "integration.sh") {
+        return {
+          exitCode: 0,
+          signal: null,
+          stdout: JSON.stringify({
+            sessionId: "sess-1",
+            cdpEndpoint: "ws://browser-worker:9222/devtools?token=t",
+          }),
+          stderr: "",
+          truncated: false,
+        };
+      }
+      return { exitCode: 0, signal: null, stdout: "opened", stderr: "", truncated: false };
+    };
+    const tool = makeBrowserTool(root, {
+      runner,
+      resolveHost: async (hostname) => {
+        expect(hostname).toBe("tenant-preview.example.test");
+        return [{ address: "10.43.0.20", family: 4 }];
+      },
+    });
+    const ctx = makeCtx(root);
+
+    await tool.execute({ action: "create_session" }, ctx);
+    const result = await tool.execute({
+      action: "open",
+      url: "https://tenant-preview.example.test",
+    }, ctx);
 
     expect(result.status).toBe("error");
     expect(result.errorCode).toBe("invalid_url");
@@ -200,7 +322,7 @@ describe("Browser", () => {
       }
       return { exitCode: 0, signal: null, stdout: "ok", stderr: "", truncated: false };
     };
-    const tool = makeBrowserTool(root, { runner });
+    const tool = makeBrowserTool(root, { runner, resolveHost: resolvePublicHost });
     const ctx = makeCtx(root);
 
     await tool.execute({ action: "create_session" }, ctx);

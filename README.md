@@ -61,6 +61,7 @@ runtime gates at the points where mistakes happen.
 | **Agentic loop** | The agent can plan, execute tools, evaluate outputs, and continue until the job is actually complete. |
 | **Lifecycle hooks** | Add deterministic or LLM-judged checks at `beforeLLMCall`, `beforeToolUse`, `afterToolUse`, `beforeCommit`, and more. |
 | **Execution discipline** | Acceptance criteria, verification evidence, TDD/git discipline, and commit-time gates can block weak completion claims. |
+| **Deterministic exactness** | Exact dates, time windows, counts, averages, sums, and comparisons can be forced through runtime evidence instead of model guesswork. |
 | **Replayable transcripts** | Tool calls, tool results, control events, compaction boundaries, and canonical assistant messages are persisted for restart-safe replay. |
 | **Hipocampus memory** | A layered memory system with root/daily/weekly/monthly compaction and qmd-backed recall. |
 | **User Harness Rules** | Install Markdown rules that become runtime checks, such as "deliver files before saying done." |
@@ -75,6 +76,7 @@ Clawy Agent ships with 30+ native tools and runtime subsystems:
 
 - **Workspace tools:** `FileRead`, `FileWrite`, `FileEdit`, `Glob`, `Grep`, `Bash`
 - **Web and browser:** `WebSearch`, `WebFetch`, `Browser`
+- **Deterministic workbench:** `Clock`, `DateRange`, `Calculation`
 - **Knowledge and memory:** `KnowledgeSearch`, Hipocampus recall, qmd indexing
 - **Generated outputs:** `DocumentWrite`, `SpreadsheetWrite`, `FileDeliver`, `FileSend`
 - **Artifacts:** `ArtifactCreate`, `ArtifactRead`, `ArtifactList`, `ArtifactUpdate`, `ArtifactDelete`
@@ -82,6 +84,7 @@ Clawy Agent ships with 30+ native tools and runtime subsystems:
 - **Planning and control:** `EnterPlanMode`, `ExitPlanMode`, `AskUserQuestion`, `TaskBoard`
 - **Automation:** `CronCreate`, `CronList`, `CronUpdate`, `CronDelete`
 - **Discipline:** `CommitCheckpoint`, execution contracts, verification evidence gates
+- **Skills:** workspace `skills/` loading plus `POST /v1/admin/skills/reload`
 
 Optional dependencies enable richer formats and rendering paths, including DOCX,
 PDF, HWPX, XLSX, qmd, and Playwright-backed browser work.
@@ -328,6 +331,7 @@ Quick setup:
 mkdir -p ./workspace/harness-rules
 cp examples/harness-rules/file-delivery-after-create.md ./workspace/harness-rules/
 cp examples/harness-rules/final-answer-verifier.md ./workspace/harness-rules/
+cp examples/harness-rules/tool-input-match.md ./workspace/harness-rules/
 npx tsx src/cli/index.ts start
 ```
 
@@ -360,9 +364,14 @@ When a document or spreadsheet is created, deliver it to the chat before claimin
 ```
 
 Supported triggers are `beforeCommit` and `afterToolUse`. Supported actions are
-`require_tool`, `llm_verifier`, and `block`. Unknown natural-language lines stay
-advisory; recognized patterns and structured frontmatter become executable
-rules. Set `CORE_AGENT_USER_HARNESS_RULES=off` to disable these checks.
+`require_tool`, `require_tool_input_match`, `llm_verifier`, and `block`.
+`require_tool_input_match` checks that a successful same-turn tool call used a
+specific tool input field, such as `toolName: Bash` with `inputPath: command` or
+`toolName: WebFetch` with `inputPath: url`. Conditions can also include
+`userMessageMatches` for regex-scoped rules. Unknown
+natural-language lines stay advisory; recognized patterns and structured
+frontmatter become executable rules. Set `CORE_AGENT_USER_HARNESS_RULES=off` to
+disable these checks.
 
 ## Migration Guides
 

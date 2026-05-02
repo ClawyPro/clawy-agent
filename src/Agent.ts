@@ -82,6 +82,9 @@ import { makeDocumentWriteTool } from "./tools/DocumentWrite.js";
 import { makeBrowserTool } from "./tools/Browser.js";
 import { makeWebFetchTool } from "./tools/WebFetch.js";
 import { makeWebSearchTool } from "./tools/WebSearch.js";
+import { makeClockTool } from "./tools/Clock.js";
+import { makeDateRangeTool } from "./tools/DateRange.js";
+import { makeCalculationTool } from "./tools/Calculation.js";
 import { makeKnowledgeSearchTool } from "./tools/KnowledgeSearch.js";
 import { makeFileDeliverTool } from "./tools/FileDeliver.js";
 import { makeFileSendTool } from "./tools/FileSend.js";
@@ -134,6 +137,12 @@ export interface BackgroundTaskDeliveryInput {
   status: BackgroundTaskDeliveryStatus;
   finalText?: string;
   errorMessage?: string;
+}
+
+export interface SkillReloadResult {
+  loaded: number;
+  issues: number;
+  runtimeHooks: number;
 }
 
 const MAX_BACKGROUND_DELIVERY_BYTES = 15 * 1024;
@@ -318,6 +327,7 @@ export class Agent {
   private readonly activeTurns = new Map<string, Turn>();
   /** C1 — live channel adapters. Populated in start() when tokens set. */
   private readonly channelAdapters: ChannelAdapter[] = [];
+  private skillRuntimeHooksRegistered = false;
   /**
    * Coding Discipline default — produced by `.discipline.yaml` on
    * Agent.start() or by falling through to {@link DEFAULT_DISCIPLINE}.
@@ -476,6 +486,9 @@ export class Agent {
     this.tools.register(makeBrowserTool(config.workspaceRoot));
     this.tools.register(makeWebSearchTool());
     this.tools.register(makeWebFetchTool());
+    this.tools.register(makeClockTool());
+    this.tools.register(makeDateRangeTool());
+    this.tools.register(makeCalculationTool());
     this.tools.register(makeSpreadsheetWriteTool(config.workspaceRoot, this.outputArtifacts));
     this.tools.register(
       makeFileSendTool({
@@ -891,39 +904,8 @@ export class Agent {
       `[core-agent] hooks: builtin registered=${hookResult.registered} skipped=[${hookResult.skipped.join(",")}]`,
     );
 
-    // Phase 2a: load workspace skills as first-class Tools (§9.8 P1).
-    // Failure here is non-fatal — the bot still has the 6 core tools.
-    const skillsDir = path.join(this.config.workspaceRoot, "skills");
     try {
-      const n = await this.tools.loadSkills(skillsDir, this.config.workspaceRoot, {
-        trustedSkillRoots: splitPathListEnv(
-          process.env.CLAWY_TRUSTED_SKILL_ROOTS ??
-            process.env.CORE_AGENT_TRUSTED_SKILL_ROOTS,
-        ),
-        trustedSkillDirs: splitPathListEnv(
-          process.env.CLAWY_TRUSTED_SKILL_DIRS ??
-            process.env.CORE_AGENT_TRUSTED_SKILL_DIRS,
-        ),
-      });
-      const rpt = this.tools.skillReport();
-      const issues = rpt?.issues.length ?? 0;
-      const runtimeHooks = rpt
-        ? registerSkillRuntimeHooks(this.hooks, rpt.runtimeHooks)
-        : 0;
-      console.log(
-        `[core-agent] skills: loaded=${n} issues=${issues} runtimeHooks=${runtimeHooks} from ${skillsDir}`,
-      );
-      // Keep KB search deterministic even when a workspace ships a
-      // prompt-only skill with the same name.
-      this.tools.replace(makeKnowledgeSearchTool({ name: "knowledge-search" }));
-      this.tools.replace(makeKnowledgeSearchTool({ name: "KnowledgeSearch" }));
-      // Keep native browser deterministic even when a workspace ships a
-      // prompt-only skill with the same name.
-      this.tools.replace(makeBrowserTool(this.config.workspaceRoot));
-      // Keep native web tools deterministic even when a workspace ships
-      // prompt-only skills with the same names.
-      this.tools.replace(makeWebSearchTool());
-      this.tools.replace(makeWebFetchTool());
+      await this.reloadWorkspaceSkills();
     } catch (err) {
       console.warn(`[core-agent] skill load failed: ${(err as Error).message}`);
     }
@@ -991,6 +973,51 @@ export class Agent {
     this.startWebAppAdapter();
 
     // Phase 1b: session registry is hydrated lazily on first ingress.
+  }
+
+  /**
+   * Reload prompt/script skills from the bot workspace without restarting the
+   * pod. Used during startup and by the admin skills refresh endpoint.
+   */
+  async reloadWorkspaceSkills(): Promise<SkillReloadResult> {
+    const skillsDir = path.join(this.config.workspaceRoot, "skills");
+    const loaded = await this.tools.loadSkills(skillsDir, this.config.workspaceRoot, {
+      trustedSkillRoots: splitPathListEnv(
+        process.env.CLAWY_TRUSTED_SKILL_ROOTS ??
+          process.env.CORE_AGENT_TRUSTED_SKILL_ROOTS,
+      ),
+      trustedSkillDirs: splitPathListEnv(
+        process.env.CLAWY_TRUSTED_SKILL_DIRS ??
+          process.env.CORE_AGENT_TRUSTED_SKILL_DIRS,
+      ),
+    });
+    const rpt = this.tools.skillReport();
+    const issues = rpt?.issues.length ?? 0;
+    let runtimeHooks = 0;
+    if (rpt && !this.skillRuntimeHooksRegistered) {
+      runtimeHooks = registerSkillRuntimeHooks(this.hooks, rpt.runtimeHooks);
+      if (rpt.runtimeHooks.length > 0) {
+        this.skillRuntimeHooksRegistered = true;
+      }
+    }
+    this.restoreNativeToolOverrides();
+    console.log(
+      `[core-agent] skills: loaded=${loaded} issues=${issues} runtimeHooks=${runtimeHooks} from ${skillsDir}`,
+    );
+    return { loaded, issues, runtimeHooks };
+  }
+
+  private restoreNativeToolOverrides(): void {
+    // Keep native tools deterministic even when a workspace ships
+    // prompt-only skills with the same names.
+    this.tools.replace(makeKnowledgeSearchTool({ name: "knowledge-search" }));
+    this.tools.replace(makeKnowledgeSearchTool({ name: "KnowledgeSearch" }));
+    this.tools.replace(makeBrowserTool(this.config.workspaceRoot));
+    this.tools.replace(makeWebSearchTool());
+    this.tools.replace(makeWebFetchTool());
+    this.tools.replace(makeClockTool());
+    this.tools.replace(makeDateRangeTool());
+    this.tools.replace(makeCalculationTool());
   }
 
   /** Construct + start any channel adapters whose tokens are set. */

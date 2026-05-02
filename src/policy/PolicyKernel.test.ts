@@ -183,6 +183,52 @@ describe("PolicyKernel", () => {
     ]);
   });
 
+  it("loads structured harness rules that require a matching tool input", async () => {
+    const root = await makeWorkspaceRoot();
+    await fs.writeFile(
+      path.join(root, "USER-HARNESS-RULES.md"),
+      [
+        "---",
+        "id: tossplace-merchant-grounding",
+        "trigger: beforeCommit",
+        "condition:",
+        "  userMessageMatches: \"(토스|토스플레이스|POS).*(연결|연동|해제|등록|매장)\"",
+        "action:",
+        "  type: require_tool_input_match",
+        "  toolName: Bash",
+        "  inputPath: command",
+        "  pattern: \"integration\\\\.sh\\\\s+['\\\"]?tossplace/my-merchants\"",
+        "enforcement: block_on_fail",
+        "---",
+        "",
+        "Toss POS connection answers must be grounded in the merchant connection endpoint.",
+      ].join("\n"),
+      "utf8",
+    );
+    const kernel = new PolicyKernel(new Workspace(root));
+
+    const snapshot = await kernel.current();
+
+    expect(snapshot.policy.harnessRules).toContainEqual(
+      expect.objectContaining({
+        id: "tossplace-merchant-grounding",
+        condition: {
+          userMessageMatches:
+            "(토스|토스플레이스|POS).*(연결|연동|해제|등록|매장)",
+        },
+        action: {
+          type: "require_tool_input_match",
+          toolName: "Bash",
+          inputPath: "command",
+          pattern: "integration\\.sh\\s+['\"]?tossplace/my-merchants",
+        },
+      }),
+    );
+    expect(snapshot.status.harnessDirectives).toContain(
+      "tossplace-merchant-grounding beforeCommit require_tool_input_match Bash command block_on_fail",
+    );
+  });
+
   it("keeps unknown lines advisory and warns on conflicting language directives", async () => {
     const root = await makeWorkspaceRoot(
       [
