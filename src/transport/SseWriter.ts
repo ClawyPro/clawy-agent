@@ -103,6 +103,14 @@ export type AgentEvent =
       errorMessage?: string;
     }
   | {
+      /** Background task status observed through TaskList/TaskGet. */
+      type: "background_task";
+      taskId: string;
+      persona: string;
+      status: "running" | "completed" | "failed" | "aborted";
+      detail?: string;
+    }
+  | {
       /** SpawnAgent child lifecycle — live mirror of durable control events. */
       type: "child_started";
       taskId: string;

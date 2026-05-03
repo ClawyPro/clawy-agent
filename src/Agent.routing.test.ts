@@ -49,4 +49,10 @@ describe("Agent native routing", () => {
     expect(agent.router).not.toBeNull();
     expect(agent.llm).toBeInstanceOf(DirectLLMClient);
   });
+
+  it("registers social browser as a native core-agent tool", () => {
+    const agent = new Agent(config());
+
+    expect(agent.tools.resolve("SocialBrowser")).not.toBeNull();
+  });
 });

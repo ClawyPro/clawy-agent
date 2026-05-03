@@ -394,6 +394,21 @@ export function safeAgentEvent(event: unknown): SafeAgentEvent | null {
         status: oneOf(event.status, ["ok", "error", "aborted"] as const, "error"),
         toolCallCount: num(event.toolCallCount),
       };
+    case "background_task": {
+      const safe: SafeAgentEvent = {
+        type: "background_task",
+        taskId: text(event.taskId, "task"),
+        persona: text(event.persona, "agent", 96),
+        status: oneOf(
+          event.status,
+          ["running", "completed", "failed", "aborted"] as const,
+          "running",
+        ),
+      };
+      const detail = maybeText(event.detail, 240);
+      if (detail) safe.detail = detail;
+      return safe;
+    }
     case "child_started":
     case "child_progress":
     case "child_tool_request":

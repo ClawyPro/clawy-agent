@@ -43,7 +43,7 @@ export function makeTaskGetTool(
     },
     async execute(
       input: TaskGetInput,
-      _ctx: ToolContext,
+      ctx: ToolContext,
     ): Promise<ToolResult<TaskGetOutput>> {
       const start = Date.now();
       try {
@@ -56,10 +56,26 @@ export function makeTaskGetTool(
             durationMs: Date.now() - start,
           };
         }
+        emitRunningBackgroundTask(ctx, record);
         return { status: "ok", output: record, durationMs: Date.now() - start };
       } catch (err) {
         return errorResult(err, start);
       }
     },
   };
+}
+
+export function emitRunningBackgroundTask(
+  ctx: Pick<ToolContext, "emitAgentEvent">,
+  record: BackgroundTaskRecord,
+): void {
+  if (record.status !== "running") return;
+  const latestProgress = record.progress?.at(-1)?.label;
+  ctx.emitAgentEvent?.({
+    type: "background_task",
+    taskId: record.taskId,
+    persona: record.persona,
+    status: record.status,
+    ...(latestProgress ? { detail: latestProgress } : {}),
+  });
 }

@@ -174,6 +174,72 @@ describe("BackgroundTasks — T2-10 end-to-end", () => {
     expect(record.resultText).toBe("bg done");
   });
 
+  it("TaskGet emits a background_task event for inspected running tasks", async () => {
+    await registry.create({
+      taskId: "task_running",
+      parentTurnId: "turn-parent",
+      sessionKey: "agent:main:app:general",
+      persona: "writer",
+      prompt: "write chapters",
+    });
+    await registry.recordProgress("task_running", "Drafting chapter 4");
+
+    const events: unknown[] = [];
+    const getTool = makeTaskGetTool(registry);
+    const got = await getTool.execute(
+      { taskId: "task_running" },
+      makeCtx({ emitAgentEvent: (event) => events.push(event) }),
+    );
+
+    expect(got.status).toBe("ok");
+    expect(events).toContainEqual({
+      type: "background_task",
+      taskId: "task_running",
+      persona: "writer",
+      status: "running",
+      detail: "Drafting chapter 4",
+    });
+  });
+
+  it("TaskList emits background_task events for returned running tasks", async () => {
+    await registry.create({
+      taskId: "task_a",
+      parentTurnId: "turn-parent",
+      sessionKey: "agent:main:app:general",
+      persona: "researcher",
+      prompt: "collect sources",
+    });
+    await registry.create({
+      taskId: "task_b",
+      parentTurnId: "turn-parent",
+      sessionKey: "agent:main:app:general",
+      persona: "reviewer",
+      prompt: "review output",
+    });
+    await registry.attachResult("task_b", {
+      status: "completed",
+      resultText: "done",
+    });
+
+    const events: unknown[] = [];
+    const listTool = makeTaskListTool(registry);
+    const list = await listTool.execute(
+      { sessionKey: "agent:main:app:general" },
+      makeCtx({ emitAgentEvent: (event) => events.push(event) }),
+    );
+
+    expect(list.status).toBe("ok");
+    expect(events).toContainEqual({
+      type: "background_task",
+      taskId: "task_a",
+      persona: "researcher",
+      status: "running",
+    });
+    expect(events).not.toContainEqual(
+      expect.objectContaining({ taskId: "task_b", status: "completed" }),
+    );
+  });
+
   it("(2) TaskOutput returns resultText + durationMs after completion", async () => {
     const script: MockScript = {
       rounds: [
