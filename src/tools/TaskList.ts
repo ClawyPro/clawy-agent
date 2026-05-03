@@ -13,6 +13,7 @@ import type {
   BackgroundTaskStatus,
 } from "../tasks/BackgroundTaskRegistry.js";
 import { errorResult } from "../util/toolResult.js";
+import { emitRunningBackgroundTask } from "./TaskGet.js";
 
 export interface TaskListInput {
   status?: BackgroundTaskStatus;
@@ -64,7 +65,7 @@ export function makeTaskListTool(
     kind: "core",
     async execute(
       input: TaskListInput,
-      _ctx: ToolContext,
+      ctx: ToolContext,
     ): Promise<ToolResult<TaskListOutput>> {
       const start = Date.now();
       try {
@@ -74,6 +75,9 @@ export function makeTaskListTool(
           ...(input.limit ? { limit: input.limit } : {}),
           ...(input.cursor ? { cursor: input.cursor } : {}),
         });
+        for (const task of page.tasks) {
+          emitRunningBackgroundTask(ctx, task);
+        }
         return {
           status: "ok",
           output: page.nextCursor

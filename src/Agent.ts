@@ -80,6 +80,7 @@ import { makeArtifactUpdateTool } from "./tools/ArtifactUpdate.js";
 import { makeArtifactDeleteTool } from "./tools/ArtifactDelete.js";
 import { makeDocumentWriteTool } from "./tools/DocumentWrite.js";
 import { makeBrowserTool } from "./tools/Browser.js";
+import { makeSocialBrowserTool } from "./tools/SocialBrowser.js";
 import { makeWebFetchTool } from "./tools/WebFetch.js";
 import { makeWebSearchTool } from "./tools/WebSearch.js";
 import { makeClockTool } from "./tools/Clock.js";
@@ -484,6 +485,7 @@ export class Agent {
     this.tools.register(makeKnowledgeSearchTool({ name: "knowledge-search" }));
     this.tools.register(makeKnowledgeSearchTool({ name: "KnowledgeSearch" }));
     this.tools.register(makeBrowserTool(config.workspaceRoot));
+    this.tools.register(makeSocialBrowserTool(config.workspaceRoot));
     this.tools.register(makeWebSearchTool({ name: "web-search" }));
     this.tools.register(makeWebSearchTool({ name: "WebSearch" }));
     this.tools.register(makeWebSearchTool({ name: "web_search" }));
@@ -1035,6 +1037,7 @@ export class Agent {
     this.tools.replace(makeKnowledgeSearchTool({ name: "knowledge-search" }));
     this.tools.replace(makeKnowledgeSearchTool({ name: "KnowledgeSearch" }));
     this.tools.replace(makeBrowserTool(this.config.workspaceRoot));
+    this.tools.replace(makeSocialBrowserTool(this.config.workspaceRoot));
     this.tools.replace(makeWebSearchTool({ name: "web-search" }));
     this.tools.replace(makeWebSearchTool({ name: "WebSearch" }));
     this.tools.replace(makeWebSearchTool({ name: "web_search" }));

@@ -82,7 +82,7 @@ evidence, and deterministic evidence through the turn.
 Clawy Agent ships with 30+ native tools and runtime subsystems:
 
 - **Workspace tools:** `FileRead`, `FileWrite`, `FileEdit`, `Glob`, `Grep`, `Bash`
-- **Web and browser:** `WebSearch`, `WebFetch`, `Browser`
+- **Web and browser:** `WebSearch`, `WebFetch`, `Browser`, `SocialBrowser`
 - **Deterministic workbench:** `Clock`, `DateRange`, `Calculation`
 - **Knowledge and memory:** `KnowledgeSearch`, Hipocampus recall, qmd indexing
 - **Generated outputs:** `DocumentWrite`, `SpreadsheetWrite`, `FileDeliver`, `FileSend`
@@ -95,6 +95,20 @@ Clawy Agent ships with 30+ native tools and runtime subsystems:
 
 Optional dependencies enable richer formats and rendering paths, including DOCX,
 PDF, HWPX, XLSX, qmd, and Playwright-backed browser work.
+
+`Browser` uses the external `agent-browser` and `integration.sh` helpers for
+centralized browser-worker sessions. `SocialBrowser` uses the same browser
+control path, but only against a user-authorized Instagram/X session claimed
+through `integration.sh social-browser/*`. Standalone deployments that want this
+tool must provide those integration endpoints:
+
+- `social-browser/status?provider=instagram|x`
+- `social-browser/claim` with `{provider,maxItems}` returning
+  `{provider,sessionId,cdpEndpoint,maxItems,expiresAt?}`
+- `social-browser/close?provider=instagram|x`
+
+The runtime keeps navigation provider-scoped, redacts CDP endpoints/tokens from
+tool output, and caps visible scraped items.
 
 ## Architecture
 
@@ -204,8 +218,8 @@ Operators can extend the runtime without forking it:
   reloaded through `POST /v1/admin/skills/reload`
 
 Native tools are restored after skill loading, so a workspace skill cannot
-accidentally replace core tools such as `Browser`, `WebSearch`, `WebFetch`,
-`Clock`, `DateRange`, or `Calculation`.
+accidentally replace core tools such as `Browser`, `SocialBrowser`,
+`WebSearch`, `WebFetch`, `Clock`, `DateRange`, or `Calculation`.
 
 ## Quick Start
 

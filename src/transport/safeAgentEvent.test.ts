@@ -56,6 +56,24 @@ describe("safeAgentEvent", () => {
     });
   });
 
+  it("allows background task status events without exposing prompts", () => {
+    expect(safeAgentEvent({
+      type: "background_task",
+      taskId: "task-1",
+      persona: "writer",
+      status: "running",
+      detail: "Drafting chapter 4",
+      prompt: "private full task prompt",
+      resultText: "private result",
+    })).toEqual({
+      type: "background_task",
+      taskId: "task-1",
+      persona: "writer",
+      status: "running",
+      detail: "Drafting chapter 4",
+    });
+  });
+
   it("removes queued message text while preserving queue counts", () => {
     expect(safeAgentEvent({
       type: "injection_queued",
