@@ -28,6 +28,7 @@ import { mcpRoutes } from "./routes/mcp.js";
 import { heartbeatRoutes } from "./routes/heartbeat.js";
 import { parityRoutes } from "./routes/parity.js";
 import { skillsRoutes } from "./routes/skills.js";
+import { appRoutes } from "./routes/app.js";
 
 export interface HttpServerOptions {
   port: number;
@@ -88,6 +89,7 @@ export class HttpServer {
   /** Flat dispatch table; walked top-to-bottom. See routes/*.ts. */
   private get routes(): RouteHandler[] {
     return [
+      ...appRoutes,
       ...healthRoutes,
       ...complianceRoutes,
       ...sessionRoutes,

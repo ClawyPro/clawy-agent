@@ -146,6 +146,10 @@ routes.
 
 ## Milestones
 
+Status on 2026-05-04: M0 is complete and the first M1 shell is present at
+`/app` in server mode. The shell is intentionally dependency-free and talks to
+the runtime through the documented HTTP/SSE surface.
+
 ### M0: Boundary And Marketing
 
 - Keep this boundary document in the OSS repo.

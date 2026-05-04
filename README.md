@@ -27,6 +27,11 @@ credentials, production auth, hosted data contracts, and operator backoffice sta
 hosted-only. See the [open-source app plan](docs/plans/2026-05-04-open-source-agent-app.md)
 for scope, architecture, milestones, and release gates.
 
+The first app shell is included at `/app` when you run `clawy-agent serve`.
+It connects to the same local runtime over HTTP/SSE, streams turns, shows
+runtime events, and keeps provider secrets out of the browser by using a
+separate server token.
+
 ## Why Clawy Agent
 
 Most agent frameworks give you a model, a tool schema, and a loop. That is not
@@ -284,11 +289,21 @@ Terminal conversation mode for local work.
 ### Server
 
 ```bash
+export CLAWY_AGENT_SERVER_TOKEN=$(openssl rand -hex 24)
 npx tsx src/cli/index.ts serve --port 8080
 ```
 
 Starts the HTTP API server. If Telegram or Discord tokens are configured, the
 same process also connects to those channels.
+
+Open the self-hosted app at:
+
+```text
+http://localhost:8080/app
+```
+
+Use `CLAWY_AGENT_SERVER_TOKEN` as the app's server token. Do not paste your LLM
+provider API key into the browser.
 
 ### Programmatic
 
@@ -317,6 +332,9 @@ llm:
   provider: anthropic          # anthropic, openai, or google
   model: claude-sonnet-4-6
   apiKey: ${ANTHROPIC_API_KEY}
+
+server:
+  gatewayToken: ${CLAWY_AGENT_SERVER_TOKEN}
 
 channels:
   telegram:

@@ -27,6 +27,13 @@ export interface ClawyAgentConfig {
     enabled?: boolean;
     compaction?: boolean;
   };
+  server?: {
+    /**
+     * HTTP bearer token for local/self-hosted API access. Keep this separate
+     * from llm.apiKey so browser clients never need the provider secret.
+     */
+    gatewayToken?: string;
+  };
   workspace?: string;
   identity?: {
     name?: string;

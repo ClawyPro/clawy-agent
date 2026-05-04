@@ -1,0 +1,83 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Clawy Agent App</title>
+    <link rel="stylesheet" href="/app/styles.css" />
+  </head>
+  <body>
+    <div class="shell">
+      <aside class="sidebar">
+        <div class="brand">
+          <span class="brand-mark">C</span>
+          <div>
+            <h1>Clawy Agent App</h1>
+            <p>Self-hosted runtime workbench</p>
+          </div>
+        </div>
+
+        <form id="connection-form" class="panel">
+          <label>
+            Agent URL
+            <input id="agent-url" name="agentUrl" autocomplete="url" />
+          </label>
+          <label>
+            Server token
+            <input id="server-token" name="serverToken" type="password" autocomplete="off" />
+          </label>
+          <label>
+            Session key
+            <input id="session-key" name="sessionKey" autocomplete="off" />
+          </label>
+          <label class="check-row">
+            <input id="plan-mode" name="planMode" type="checkbox" />
+            Plan mode
+          </label>
+          <button type="submit">Save Connection</button>
+          <button id="health-button" type="button" class="secondary">Check Runtime</button>
+        </form>
+
+        <section class="panel">
+          <h2>Runtime State</h2>
+          <dl id="runtime-state">
+            <div>
+              <dt>Status</dt>
+              <dd id="runtime-status">Not checked</dd>
+            </div>
+            <div>
+              <dt>Events</dt>
+              <dd id="event-count">0</dd>
+            </div>
+          </dl>
+        </section>
+      </aside>
+
+      <main class="workspace">
+        <section class="timeline-panel">
+          <header>
+            <div>
+              <h2>Conversation</h2>
+              <p id="session-label">agent:local:app:web:default</p>
+            </div>
+            <button id="clear-button" type="button" class="icon-button" title="Clear local view">Clear</button>
+          </header>
+          <div id="messages" class="messages" aria-live="polite"></div>
+          <form id="message-form" class="composer">
+            <textarea id="message-input" rows="3" placeholder="Ask the agent to do real work..."></textarea>
+            <button id="send-button" type="submit">Send</button>
+          </form>
+        </section>
+
+        <aside class="inspector">
+          <header>
+            <h2>Runtime Timeline</h2>
+            <p>Tool calls, checkpoints, delivery, and task events stream here.</p>
+          </header>
+          <div id="events" class="events"></div>
+        </aside>
+      </main>
+    </div>
+    <script src="/app/app.js" type="module"></script>
+  </body>
+</html>

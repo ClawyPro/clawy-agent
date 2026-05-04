@@ -47,6 +47,11 @@ llm:
   model: ${opts.model}
   apiKey: \${${opts.apiKeyEnvVar}}
 
+# Local/self-hosted HTTP API token.
+# Use this in Clawy Agent App. Do not use your provider API key in the browser.
+server:
+  gatewayToken: \${CLAWY_AGENT_SERVER_TOKEN}
+
 # Channels (uncomment to enable)
 # channels:
 #   telegram:
@@ -159,7 +164,8 @@ export async function runInit(): Promise<void> {
   console.log("");
   console.log(`Next steps:`);
   console.log(`  1. Set your API key:  export ${apiKeyEnvVar}=sk-...`);
-  console.log(`  2. Start interactive: clawy-agent start`);
-  console.log(`  3. Or run as server:  clawy-agent serve --port 8080`);
+  console.log(`  2. Set an app token:  export CLAWY_AGENT_SERVER_TOKEN=$(openssl rand -hex 24)`);
+  console.log(`  3. Start interactive: clawy-agent start`);
+  console.log(`  4. Or run as server:  clawy-agent serve --port 8080`);
   console.log("");
 }

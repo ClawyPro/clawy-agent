@@ -7,6 +7,11 @@ llm:
   model: claude-sonnet-4-6
   apiKey: ${ANTHROPIC_API_KEY}  # Environment variable reference
 
+# Local/self-hosted HTTP API token.
+# Use this in Clawy Agent App. Do not put your provider API key in the browser.
+server:
+  gatewayToken: ${CLAWY_AGENT_SERVER_TOKEN}
+
 # Channels (optional — enable the ones you need)
 # channels:
 #   telegram:
