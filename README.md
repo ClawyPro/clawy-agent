@@ -1,23 +1,19 @@
-# Clawy Agent
+# Magi
 
-**Open-source runtime for personal AI agents that can finish work reliably.**
+**An autonomous AI agent runtime that verifies LLM output before committing it to the conversation.**
 
-Clawy Agent is not a prompt chain and not a chatbot wrapper. It is a durable
-agent runtime: every task runs inside an observable loop with tool execution,
-runtime checks, persistent transcripts, memory, deterministic evidence, file
-delivery, scheduled automation, and user-defined harness rules.
+Magi is not a prompt chain and not a chatbot wrapper. It is a durable agent
+runtime built for bots that run without human supervision — responding to
+Telegram messages at 3 AM, executing scheduled tasks via cron, and managing
+multi-step pipelines where no one is checking each intermediate answer.
 
-If you are tired of agents that create files but forget to send them, claim work
-is done without verification, compute dates or totals from model intuition, lose
-context after a restart, misroute scheduled jobs, or ignore workflow
-instructions buried in the prompt, Clawy Agent moves those behaviors out of
-vibes and into runtime state.
-
-Think Claude Code, but open-source, multi-provider, always-on, and programmable.
+Most agent runtimes control what the model *can* do (permissions, sandboxing).
+Magi also verifies whether the model *actually did it correctly* before the
+output reaches the user.
 
 ## Self-Hosted App
 
-Clawy Agent includes **Clawy Agent App**, a self-hostable workbench for running
+Magi includes **Magi App**, a self-hostable workbench for running
 a Codex-like personal agent app with your own provider, workspace, tools,
 memory, schedules, and harness rules.
 
@@ -26,32 +22,42 @@ turns, shows live sessions, background tasks, scheduled jobs, artifacts, loaded
 skills, and runtime events, and keeps provider secrets out of the browser by
 using a separate server token.
 
-The goal is to keep the visible app surface open while keeping hosted Clawy
-Cloud's production control plane separate: billing, fleet provisioning, managed
-credentials, production auth, hosted data contracts, and operator backoffice stay
-hosted-only. See the [open-source app plan](docs/plans/2026-05-04-open-source-agent-app.md)
-for scope, architecture, milestones, and release gates.
+The goal is to keep the visible app surface open while keeping the hosted
+[Clawy Pro](https://clawy.pro) production control plane separate: billing,
+fleet provisioning, managed credentials, production auth, hosted data contracts,
+and operator backoffice stay hosted-only. See the
+[open-source app plan](docs/plans/2026-05-04-open-source-agent-app.md) for
+scope, architecture, milestones, and release gates.
 
-## Why Clawy Agent
+## Why Magi?
 
-Most agent frameworks give you a model, a tool schema, and a loop. That is not
-enough for real personal agents.
+- **LLM output is speculation, not truth.** Every response is a draft until it
+  passes verification hooks — runtime-enforced, not prompt-requested.
+- **Permission ≠ correctness.** Sandboxes control what the agent *can* do. Magi
+  verifies whether it *actually did it correctly*.
+- **Fail-open, not fail-stuck.** Every verification hook times out gracefully. A
+  stuck verifier is worse than an imperfect answer.
+- **Built for 3 AM.** Designed for agents that respond to Telegram at 3 AM, run
+  cron jobs, and manage multi-step pipelines with no one watching.
 
-Real agents need to:
+We cataloged the failure modes from running 30+ autonomous bots in production.
+The most common failures are not dramatic — they are plausible-sounding answers
+that happen to be wrong:
 
-- keep working across long tasks, restarts, and channel reconnects
-- remember user context without stuffing the whole chat into the next prompt
-- run tools while respecting file boundaries, safety rules, and permissions
-- pause for user input without losing the turn
-- verify work, exact values, and source usage before committing a final answer
-- deliver generated files back to the user instead of only writing them to disk
-- run scheduled workflows without letting the model guess delivery channels or
-  execute worker tasks in the wrong role
-- expose the control surface so operators can add rules without forking core code
+- The agent says "I fixed the bug and tests pass" without ever running tests
+- It promises "I'll send the report later" and never does
+- It reads financial data, then reports wrong numbers in the answer
+- It references files it never actually read
 
-Clawy Agent is built around that premise. The LLM is the reasoning engine; the
-runtime is the discipline layer that decides what must be evidenced,
-persisted, retried, blocked, or delivered.
+None of these failures involve exceeding permissions. The agent had access to
+every tool. The problem is it chose not to use them, or used them and
+misreported the results. Permission gates are orthogonal to answer quality.
+
+Magi is built around that premise. The LLM is the reasoning engine; the runtime
+is the discipline layer that decides what must be evidenced, persisted, retried,
+blocked, or delivered.
+
+[Full architecture comparison: Magi vs Claude Code →](https://clawy.pro/blog/magi-vs-claude-code)
 
 ## The Runtime Model
 
@@ -77,6 +83,28 @@ runtime gates at the points where mistakes happen, backed by an
 `ExecutionContract` that carries criteria, resource bindings, verification
 evidence, and deterministic evidence through the turn.
 
+## Verification Hooks (built-in)
+
+The commit pipeline runs a series of hooks before any LLM output reaches the
+user. Each hook targets a specific failure mode observed in production.
+
+| Hook | Catches |
+| --- | --- |
+| `deferralBlocker` | "I'll send it later" promises with no scheduled delivery |
+| `selfClaimVerifier` | Claims about files or data without supporting reads |
+| `factGroundingVerifier` | Tool results that contradict the stated answer |
+| `resourceExistenceChecker` | References to files never read |
+| `goalProgressGate` | Text-only responses to action requests |
+| `completionEvidenceGate` | "Fixed it" without running tests |
+| `answerVerifier` | Deflection, partial answers, or refusal |
+| `deterministicEvidenceVerifier` | Numeric/date claims not backed by tool evidence |
+
+When a hook blocks, it injects a corrective message and the model resamples
+(up to 3 retries). After exhaustion, the last draft is delivered as-is —
+fail-open, always.
+
+Custom hooks via `clawy-agent.yaml` or workspace harness rules.
+
 ## What Makes It Different
 
 | Capability | What it means in practice |
@@ -96,7 +124,7 @@ evidence, and deterministic evidence through the turn.
 
 ## Built-In Capabilities
 
-Clawy Agent ships with 30+ native tools and runtime subsystems:
+Magi ships with 30+ native tools and runtime subsystems:
 
 - **Workspace tools:** `FileRead`, `FileWrite`, `FileEdit`, `Glob`, `Grep`, `Bash`
 - **Web and browser:** `WebSearch`, `WebFetch`, `Browser`, `SocialBrowser`
@@ -165,7 +193,7 @@ Design principles:
 
 ## Reliability Architecture
 
-Clawy Agent is designed for the failure modes that show up once agents are used
+Magi is designed for the failure modes that show up once agents are used
 for real work, not only demos.
 
 ### Execution Contracts
@@ -202,7 +230,7 @@ the final answer.
 ### Scheduled Work
 
 Cron jobs are treated as durable workflows, not delayed chat messages. When a
-cron is created, Clawy Agent captures the source delivery channel instead of
+cron is created, Magi captures the source delivery channel instead of
 asking the model to choose a target later. When the cron fires, the parent turn
 is constrained to meta-orchestration: inspect the schedule, delegate the actual
 work to a child agent, and summarize or deliver the result.
@@ -217,7 +245,7 @@ Cron safety is enforced through several runtime pieces working together:
 - `TaskBoard` iteration state, the sweeper, and stop conditions keep long
   scheduled loops restart-safe and bounded
 
-That is how Clawy Agent avoids the common failure where a scheduled agent
+That is how Magi avoids the common failure where a scheduled agent
 ignores the workflow boundary, opens the wrong resource, or sends the result to
 the wrong channel.
 
@@ -532,6 +560,13 @@ disable these checks.
 
 - Node.js 22+
 - An API key for Anthropic, OpenAI, or Google
+
+## Managed Platform
+
+Magi is the open-source runtime. [Clawy Pro](https://clawy.pro) is the managed
+platform — one-click deploy, knowledge base, billing, multi-channel routing, and
+100+ skill catalog. Everything you need to run production bots without managing
+infrastructure.
 
 ## Contributing
 
